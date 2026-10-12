@@ -29,6 +29,11 @@ class KerMappingTests(unittest.TestCase):
         self.mapping["left"]["signs"][0] = -1
         self.mapping["left"]["zero_degrees"][0] = 15
         self.mapping["left"]["offset_rad"][0] = .1
+        # Gripper numbers below assume a 0°/±60° stroke, not the measured file.
+        self.mapping["left"]["gripper_open_degrees"] = 0
+        self.mapping["left"]["gripper_closed_degrees"] = 60
+        self.mapping["right"]["gripper_open_degrees"] = 0
+        self.mapping["right"]["gripper_closed_degrees"] = -60
         target = map_angles(raw, self.mapping)
         self.assertAlmostEqual(target[0], -3.141592653589793/6+.1)
         self.assertAlmostEqual(target[8], 3.141592653589793/2)
@@ -41,11 +46,18 @@ class KerMappingTests(unittest.TestCase):
                 map_angles(raw, self.mapping)
 
     def test_trigger_threshold_uses_each_calibrated_gripper_direction(self):
+        def angle(side: str, ratio: float) -> None:
+            arm = self.mapping[side]
+            opening, closing = arm["gripper_open_degrees"], arm["gripper_closed_degrees"]
+            raw[arm["gripper_channel"]] = opening + ratio * (closing - opening)
+
         raw = [0.] * 16
-        raw[7], raw[15] = -53.9, 53.9
+        angle("left", .899)
+        angle("right", .899)
         self.assertFalse(ker_bridge.trigger_pressed(raw, self.mapping, "left"))
         self.assertFalse(ker_bridge.trigger_pressed(raw, self.mapping, "right"))
-        raw[7], raw[15] = -54, 54
+        angle("left", .9)
+        angle("right", .9)
         self.assertTrue(ker_bridge.trigger_pressed(raw, self.mapping, "left"))
         self.assertTrue(ker_bridge.trigger_pressed(raw, self.mapping, "right"))
 
@@ -58,7 +70,8 @@ class KerMappingTests(unittest.TestCase):
                 if change == "duplicate": mapping["left"]["channels"][0] = 0
                 if change == "sign": mapping["left"]["signs"][0] = 0
                 if change == "nonfinite": mapping["left"]["offset_rad"][0] = float("nan")
-                if change == "stroke": mapping["left"]["gripper_closed_degrees"] = 0
+                if change == "stroke":
+                    mapping["left"]["gripper_closed_degrees"] = mapping["left"]["gripper_open_degrees"]
                 path.write_text(yaml.safe_dump(mapping))
                 with self.assertRaises(ValueError, msg=change):
                     load_mapping(path, real=True)
@@ -71,12 +84,13 @@ class KerMappingTests(unittest.TestCase):
 class KerTriggerCalibrationTests(unittest.TestCase):
     def test_measured_short_travel_and_opposite_directions(self):
         mapping = load_mapping(ROOT / "config/ker.yaml")
+        original_closed = mapping["left"]["gripper_closed_degrees"]
         released, pressed = [0.]*16, [0.]*16
         released[15], released[7] = 2., -3.
         pressed[15], pressed[7] = 37.0689, -34.6849
         result = ker_bridge.trigger_endpoints(mapping, [released]*10, [pressed]*10)
         self.assertFalse(result["calibrated"])
-        self.assertEqual(mapping["left"]["gripper_closed_degrees"], 60)
+        self.assertEqual(mapping["left"]["gripper_closed_degrees"], original_closed)
         for side in ("left", "right"):
             self.assertFalse(ker_bridge.trigger_pressed(released, result, side))
             self.assertTrue(ker_bridge.trigger_pressed(pressed, result, side))
@@ -484,7 +498,10 @@ class KerUsbBridgeTests(unittest.TestCase):
         stream.metadata = {}
         released = {"angles": [0.] * 16}
         pressed = {"angles": [0.] * 16}
-        pressed["angles"][7], pressed["angles"][15] = -60, 60
+        mapping = load_mapping(ROOT / "config/ker.yaml")
+        for side in ("left", "right"):
+            arm = mapping[side]
+            pressed["angles"][arm["gripper_channel"]] = arm["gripper_closed_degrees"]
         stream.recv.side_effect = [released, pressed, None, None]
         sdk = types.ModuleType("openarm_ker.ker_stream")
         sdk.KERStream = Mock(return_value=stream)

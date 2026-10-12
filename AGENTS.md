@@ -22,7 +22,7 @@ cmake --build build -j           # Build C++ executables
 ./scripts/run_moveit.sh --sim   # Launch MoveIt simulation (ROS 2 required)
 ```
 
-Set `OPENARM_MUJOCO_XML` to an available scene XML; the launcher's default references an external, machine-specific path.
+`run.sh` and `script/replay_teaching.py` resolve the MuJoCo scene from the script directory (`models/OpenArm_V1/scene_table.xml`) unless `OPENARM_MUJOCO_XML` is set. If the historical `/home/ducks/.../scene_table.xml` file is still present, that path remains the default.
 
 ## Coding Style & Naming Conventions
 
@@ -30,7 +30,7 @@ Use four-space indentation in C++ and Python, matching nearby code. C++ uses C++
 
 ## Testing Guidelines
 
-No automated test suite or coverage threshold is configured. Rebuild changed C++ targets and smoke-test affected behavior in simulation. For UI or recording changes, verify start/stop, labeling, and export using disposable recordings. Document commands, results, and hardware dependencies when reporting validation.
+`.github/workflows/tests.yml` runs `unittest discover -s tests` and the Node checks on push and pull request. There is no coverage threshold. Rebuild changed C++ targets and smoke-test affected behavior in simulation. For UI or recording changes, verify start/stop, labeling, and export using disposable recordings. Document commands, results, and hardware dependencies when reporting validation.
 
 ## Commit & Pull Request Guidelines
 

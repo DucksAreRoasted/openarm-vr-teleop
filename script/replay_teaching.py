@@ -13,6 +13,18 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_SCENE = Path("/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml")
+REPO_SCENE = ROOT / "models" / "OpenArm_V1" / "scene_table.xml"
+
+
+def resolve_scene_xml() -> str:
+    """Match run.sh: env, then the historical file, then the scene in this repo."""
+    override = os.environ.get("OPENARM_MUJOCO_XML", "")
+    if override:
+        return override
+    if LEGACY_SCENE.is_file():
+        return str(LEGACY_SCENE)
+    return str(REPO_SCENE)
 
 
 def build(command: list[str]) -> None:
@@ -102,7 +114,7 @@ def main() -> int:
                        "--real" if args.real else "--sim", "--speed", str(args.speed),
                        "--repeat", str(args.repeat),
                        "--urdf", os.environ.get("OPENARM_TELEOP_URDF", str(ROOT / "assets/v1.urdf")),
-                       "--xml", os.environ.get("OPENARM_MUJOCO_XML", "/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml"),
+                       "--xml", resolve_scene_xml(),
                        "--gravity-yaml", os.environ.get("OPENARM_GRAVITY_YAML", str(ROOT / "config/gravity_comp.yaml")),
                        "--left-can", args.left_can, "--right-can", args.right_can]
             if args.source_meters:

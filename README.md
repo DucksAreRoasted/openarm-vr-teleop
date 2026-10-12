@@ -20,6 +20,7 @@ sudo apt install build-essential cmake libeigen3-dev liborocos-kdl-dev \
 ```bash
 ./app.sh            # Qt 控制台（推荐）
 ./run.sh            # 直接开 MuJoCo 仿真 + Quest WebXR 桥
+./run.sh --print-paths   # 只打印 URDF 和仿真场景路径，不编译、不启动
 ./run.sh --real     # 直接开真机双臂，默认 can1=左、can0=右
 ./scripts/run_moveit.sh --sim    # MoveIt 仿真：RViz 规划，模型跟着走
 ./scripts/run_moveit.sh --real   # MoveIt 实机：规划后执行到 CAN 双臂
@@ -74,7 +75,7 @@ RViz 默认使用系统图形驱动，显示刷新率设为 30 FPS。若报 `Una
 
 日志：`recordings/gravity/`；电机参数：`recordings/motor_params/`。真机启动会调 `scripts/configure_can.sh`（默认左 `can1`、右 `can0`，1M / 5M CAN FD），需 sudo。
 
-仿真会打开 MuJoCo 窗口。Quest 浏览器打开 `https://<这台电脑的IP>:8443`（证书在 `quest/`）。左手 UDP `47912`，右手 `47911`。
+仿真会打开 MuJoCo 窗口。默认场景是仓库内 `models/OpenArm_V1/scene_table.xml`，按 `run.sh` 所在目录解析，因此换到别的工作目录启动也找得到。`OPENARM_MUJOCO_XML` 可改场景。若本机仍有旧路径 `/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml` 且没有设置该变量，则继续用旧文件。Quest 浏览器打开 `https://<这台电脑的IP>:8443`（证书在 `quest/`）。左手 UDP `47912`，右手 `47911`。
 
 **肘部与腕部追踪**：控制台勾选“Quest 肘部与腕部追踪”，或使用 `./run.sh --skeleton --sim`。持续追踪肘部和腕部，肩点仅在进入沉浸模式时校准；需要浏览器提供 WebXR 身体关节数据。短暂丢帧冻结并重新接入，持续丢失后需重新握持 Grip。逆解限制约 60 Hz，关节参考仍按原控制频率更新。先验证仿真，操作与限制见 [Quest 肩肘骨骼追踪](docs/Quest肩肘骨骼追踪.md)。
 
@@ -102,6 +103,8 @@ VR 真机遥操默认先沿 `assets/steady_action_on_table.csv` 进入桌面姿�
 | `OPENARM_SCURVE_AMAX` | `1.2` | S 曲线最大加速度 (rad/s²) |
 | `OPENARM_SCURVE_JMAX` | `6` | S 曲线最大加加速度 (rad/s³) |
 | `OPENARM_MOVEIT_SCURVE` | `1` | MoveIt 实机：段内 S 形加减速（保持原航点时刻）；`0` 回退线性 |
+| `OPENARM_MUJOCO_XML` | 仓库内桌面场景 | 仿真场景。未设置时：旧的 `/home/ducks/.../scene_table.xml` 若存在则用它，否则用 `models/OpenArm_V1/scene_table.xml`。`run.sh` 与 `script/replay_teaching.py` 共用这条规则 |
+| `OPENARM_TELEOP_URDF` | `assets/v1.urdf` | 遥操 URDF，相对 `run.sh` 所在目录 |
 
 按钮示教不需要头显。向 `127.0.0.1:47931` 发 UDP：
 
@@ -129,4 +132,4 @@ openarm-dataset-convert recordings/sessions/<name>/openarm_dataset /tmp/lerobot 
 
 日志写在 `recordings/hm_logs/`。Apache-2.0，见 `LICENSE-APACHE` 和 `third_party/openarm_can/LICENSE.txt`。
 
-自动标定离线回归检查：`.venv/bin/python -m unittest discover -s tests -v`（不启用 CAN）。
+自动标定离线回归检查：`.venv/bin/python -m unittest discover -s tests -v`（不启用 CAN）。安全相关阈值和哪些用例在 main 上仍会跳过，见 [安全测试](docs/SAFETY_TESTS.md)。离合测试需要先编译 `human_mimic_clutch_test`。GitHub Actions（`.github/workflows/tests.yml`）在 push 和 pull request 上跑这套测试以及两个 Node 检查，不连接真机。

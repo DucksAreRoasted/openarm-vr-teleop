@@ -96,3 +96,23 @@ target_link_libraries(openarm_gravity_model PRIVATE vr_control_core pthread)
 # Offline V1 controller regression; excluded from normal builds, never opens CAN.
 add_executable(skeleton_control_smoke EXCLUDE_FROM_ALL tests/skeleton_control_smoke.cpp)
 target_link_libraries(skeleton_control_smoke PRIVATE vr_control_core pthread)
+
+# Hardware-free human_mimic clutch contract. Compiles the real controller sources
+# without CAN, MuJoCo, or the rest of vr_control_core.
+add_library(human_mimic_test_core STATIC
+  src/controller/dynamics.cpp
+  src/controller/human_mimic_kinematics.cpp
+  src/controller/virtual_arm_skeleton.cpp
+  src/controller/human_mimic_ik_solver.cpp
+  src/controller/joint_reference_generator.cpp
+  src/controller/reference_smoother.cpp
+  src/controller/human_mimic_controller.cpp)
+target_include_directories(human_mimic_test_core PUBLIC src)
+target_link_libraries(human_mimic_test_core PUBLIC Eigen3::Eigen
+  ${orocos_kdl_LIBRARIES} kdl_parser::kdl_parser urdfdom::urdfdom_model)
+
+add_executable(human_mimic_clutch_test tests/human_mimic_clutch_test.cpp)
+target_include_directories(human_mimic_clutch_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openarm_can/include)
+target_link_libraries(human_mimic_clutch_test PRIVATE human_mimic_test_core pthread)

@@ -8,13 +8,26 @@
 #   ./run.sh --ker --sim     KER USB leader -> V1 simulated follower
 #   ./run.sh --ker --real    calibrated KER -> V1 real follower
 #   ./run.sh --ker-demo      simulation with scripted KER input (no USB device)
+#   ./run.sh --print-paths   print resolved URDF and MuJoCo scene, then exit
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTROL="${ROOT}/build/quest_cartesian_control"
 BRIDGE="${ROOT}/quest/quest_bridge.py"
 URDF="${OPENARM_TELEOP_URDF:-${ROOT}/assets/v1.urdf}"
-XML="${OPENARM_MUJOCO_XML:-/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml}"
+# Scene resolution, in order:
+#   1. OPENARM_MUJOCO_XML when it is set and non-empty
+#   2. the historical machine path, when that file is still present
+#   3. the scene shipped next to this script
+LEGACY_XML="/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml"
+REPO_XML="${ROOT}/models/OpenArm_V1/scene_table.xml"
+if [[ -n "${OPENARM_MUJOCO_XML:-}" ]]; then
+  XML="${OPENARM_MUJOCO_XML}"
+elif [[ -f "${LEGACY_XML}" ]]; then
+  XML="${LEGACY_XML}"
+else
+  XML="${REPO_XML}"
+fi
 if [[ -x "${ROOT}/.venv/bin/python" ]]; then
   PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
 else
@@ -26,6 +39,7 @@ START_BRIDGE=1
 MIRROR=0
 KER=0
 KER_DEMO=0
+PRINT_PATHS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --real) SIM=0 ;;
@@ -36,9 +50,10 @@ while [[ $# -gt 0 ]]; do
     --ker-demo) KER=1; KER_DEMO=1 ;;
     --no-bridge) START_BRIDGE=0 ;;
     -h|--help)
-      sed -n '2,10p' "$0"
+      sed -n '2,11p' "$0"
       exit 0
       ;;
+    --print-paths) PRINT_PATHS=1 ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
@@ -46,6 +61,10 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+if [[ "${PRINT_PATHS}" == "1" ]]; then
+  printf 'ROOT=%s\nURDF=%s\nXML=%s\n' "${ROOT}" "${URDF}" "${XML}"
+  exit 0
+fi
 if [[ "${VR_TELEOP_MODE:-}" == "skeleton_proximal" ]]; then
   export VR_TELEOP_MODE
 fi
