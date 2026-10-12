@@ -16,6 +16,12 @@ HTTP_PORT = int(os.environ.get("OPENARM_QUEST_HTTP_PORT", "8443"))
 GRAVITY_YAML = ROOT / "config" / "gravity_comp.yaml"
 
 
+def quest_udp_host() -> str:
+    """IPv4 address shared with the Quest bridge. Default is loopback."""
+    host = os.environ.get("OPENARM_QUEST_UDP_HOST", "").strip()
+    return host or "127.0.0.1"
+
+
 def sudo_is_cached() -> bool:
     result = subprocess.run(
         ["sudo", "-n", "true"],

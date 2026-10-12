@@ -95,7 +95,7 @@ VR 真机遥操默认先沿 `assets/steady_action_on_table.csv` 进入桌面姿�
 | --- | --- | --- |
 | `VR_TELEOP_MODE` | `human_mimic` | `human_mimic` / `cartesian_precision` / `skeleton_proximal` / `pika_style` |
 | `VR_ORIENTATION` | `absolute` | `absolute` 或 `incremental` |
-| `OPENARM_QUEST_UDP_HOST` | `127.0.0.1` | Quest 桥发往控制程序的 UDP 地址，控制端绑定同一值。`0.0.0.0` 让控制端监听所有网卡；跨机时桥要填控制电脑的 IPv4，不要填 `0.0.0.0`。 |
+| `OPENARM_QUEST_UDP_HOST` | `127.0.0.1` | Quest 桥发往控制程序的 UDP 地址，控制端绑定同一值，手柄采集快捷键 `47934` 也用它。`0.0.0.0` 让控制端监听所有网卡；跨机时桥要填控制电脑的 IPv4，不要填 `0.0.0.0`。 |
 | `OPENARM_LEFT_FOLLOWER_CAN` | `can1` | 左臂 CAN |
 | `OPENARM_RIGHT_FOLLOWER_CAN` | `can0` | 右臂 CAN |
 | `OPENARM_HM_CLUTCH_START_DEG` | `2` | 握持后转过这么多度才开始跟姿态 |

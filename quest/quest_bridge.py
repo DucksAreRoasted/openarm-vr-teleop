@@ -106,6 +106,11 @@ def resolve_udp_host(cli_value: Optional[str]) -> str:
     return quest_udp_host()
 
 
+def capture_udp_target() -> tuple[str, int]:
+    """Quest capture-shortcut UDP. Host matches the other control UDP sockets."""
+    return quest_udp_host(), int(os.environ.get("OPENARM_QUEST_CAPTURE_PORT", "47934"))
+
+
 class QuestUdpForwarder:
     def __init__(self, host: str, port: int, stats: "HandBridgeStats") -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -298,7 +303,7 @@ class QuestBridge:
             payload = {"type": "capture_feedback", "action": action, "ok": False,
                        "message": "未收到采集反馈，请在 ./app.sh 控制台核对状态。"}
             try:
-                target = ("127.0.0.1", int(os.environ.get("OPENARM_QUEST_CAPTURE_PORT", "47934")))
+                target = capture_udp_target()
                 sock.connect(target)
                 await loop.sock_sendall(sock, json.dumps({"action": action}).encode())
                 response = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=.8)

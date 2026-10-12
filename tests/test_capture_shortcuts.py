@@ -51,7 +51,7 @@ class GestureTests(unittest.TestCase):
 class ConsoleShortcutTests(unittest.TestCase):
     def test_record_label_redo_and_reject_invalid_states(self):
         app = QApplication.instance() or QApplication([])
-        with patch.dict(os.environ, {"OPENARM_QUEST_CAPTURE_PORT": "0"}), \
+        with patch.dict(os.environ, {"OPENARM_QUEST_CAPTURE_PORT": "0", "OPENARM_QUEST_UDP_HOST": "127.0.0.1"}), \
              patch("openarm_app.main_window.local_ip", return_value="127.0.0.1"), \
              patch("openarm_app.main_window.list_usb_cameras", return_value=[]):
             window = MainWindow()

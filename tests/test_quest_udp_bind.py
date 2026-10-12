@@ -89,6 +89,22 @@ class QuestUdpBindTests(unittest.TestCase):
         explicit.right_forwarder.sock.close()
         explicit.left_forwarder.sock.close()
 
+    def test_capture_shortcut_follows_same_host(self) -> None:
+        sys.path.insert(0, str(ROOT / "script"))
+        from openarm_app.services import quest_udp_host as console_host
+        from quest_bridge import capture_udp_target, quest_udp_host
+
+        self.assertEqual(capture_udp_target(), ("127.0.0.1", 47934))
+        self.assertEqual(console_host(), "127.0.0.1")
+        os.environ["OPENARM_QUEST_UDP_HOST"] = "192.0.2.9"
+        os.environ["OPENARM_QUEST_CAPTURE_PORT"] = "47999"
+        try:
+            self.assertEqual(quest_udp_host(), "192.0.2.9")
+            self.assertEqual(console_host(), "192.0.2.9")
+            self.assertEqual(capture_udp_target(), ("192.0.2.9", 47999))
+        finally:
+            os.environ.pop("OPENARM_QUEST_CAPTURE_PORT", None)
+
     def test_webpage_ports_stay_on_all_interfaces(self) -> None:
         from quest_bridge import QuestBridge
 
