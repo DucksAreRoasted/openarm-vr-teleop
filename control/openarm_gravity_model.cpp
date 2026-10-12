@@ -30,9 +30,9 @@ int main(int argc, char** argv) {
             dynamics->SetLinkComDeltas(link_com_deltas_for(model, side));
             if (!dynamics->Init()) throw std::runtime_error("Cannot initialize dynamics");
             dynamics->SetUrdfGravityScale(model.urdf_scale);
-            const double motor = model.gripper_motor_kg > 0.0 ? model.gripper_motor_kg : 0.12;
-            dynamics->SetEndEffectorPointMass(2.0 * 0.03602545343277134 + motor +
-                                              model.ee_payload_kg, 0.0, 0.0, 0.1475);
+            const bool gripper_on = gripper_configured_installed(model);
+            dynamics->SetEndEffectorPointMass(end_effector_point_mass_kg(model, gripper_on), 0.0,
+                                              0.0, kOpenArmFingerComZ);
             const auto& offset = index == 0 ? model.wrist_camera_offset_left :
                                              model.wrist_camera_offset_right;
             dynamics->SetWristCameraMass(model.wrist_camera_kg, index == 0,

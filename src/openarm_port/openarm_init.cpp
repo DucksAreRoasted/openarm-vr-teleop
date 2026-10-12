@@ -14,6 +14,7 @@
 
 #include "openarm_init.hpp"
 
+#include "../controller/gravity_comp.hpp"
 #include "../openarm_constants.hpp"
 
 #include <cstdlib>
@@ -84,13 +85,16 @@ void OpenArmInitializer::initialize_(openarm::can::socket::OpenArm *openarm,
     openarm->init_arm_motors(config.arm_motor_types, config.arm_send_can_ids,
                              config.arm_recv_can_ids);
 
-    if (enable_debug) {
-        std::cout << "Initializing gripper motor..." << std::endl;
+    const bool init_gripper = config.init_gripper && !env_requests_no_gripper();
+    if (init_gripper) {
+        if (enable_debug) {
+            std::cout << "Initializing gripper motor..." << std::endl;
+        }
+        openarm->init_gripper_motor(config.gripper_motor_type, config.gripper_send_can_id,
+                                    config.gripper_recv_can_id);
+    } else if (enable_debug) {
+        std::cout << "Gripper motor left uninitialized" << std::endl;
     }
-
-    // Initialize gripper motor
-    openarm->init_gripper_motor(config.gripper_motor_type, config.gripper_send_can_id,
-                                config.gripper_recv_can_id);
 
     // Set callback mode for all motors
     openarm->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);

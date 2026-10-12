@@ -196,7 +196,8 @@ class MainWindow(QMainWindow):
         self.radio_moveit = QRadioButton("MoveIt")
         self.radio_zerog = QRadioButton("零重力")
         self.radio_zerog.setToolTip(
-            "零重力：KDL G(q) + gravity_comp.yaml（关节补偿/摩擦等）"
+            "零重力：KDL G(q) + gravity_comp.yaml（关节补偿/摩擦等）。"
+            "卸下夹爪后，若 0x18 没有反馈，会自动按无夹爪继续，重力不含指尖和夹爪电机质量。"
         )
         self.radio_mirror = QRadioButton("同向示教")
         self.radio_ker_sim = QRadioButton("KER 仿真")
@@ -205,7 +206,9 @@ class MainWindow(QMainWindow):
             radio.setToolTip("使用 USB / 串口 OpenArm KER 操作 V1 双臂及夹爪，可录制并回放。双扳机同时压下并保持 2 秒后才使能从臂。映射由 OPENARM_KER_CONFIG 指定，默认 config/ker.yaml；真机前须完成映射标定。")
         self.radio_mirror.setToolTip(
             "右臂重力补偿，可用手拖动；左臂按关节映射跟随（前后摆臂 j1、夹爪俯仰 j7 的角度和速度反号，其余同号），超出左臂行程时限位，夹爪同向跟随。\n"
-            "夹爪受阻时会柔和保持，回开右夹爪可释放。\n启动后左臂会缓慢对齐，请清空双臂空间。无需 Quest，可录制双臂和相机数据。"
+            "夹爪受阻时会柔和保持，回开右夹爪可释放。\n"
+            "卸下夹爪后，若 0x18 没有反馈，不再因缺夹爪停机，重力不含指尖和夹爪电机质量。\n"
+            "启动后左臂会缓慢对齐，请清空双臂空间。无需 Quest，可录制双臂和相机数据。"
         )
         self.radio_sim.setChecked(True)
         for i, r in enumerate(

@@ -4,6 +4,8 @@
 #include <openarm/can/socket/openarm.hpp>
 #include <openarm/damiao_motor/dm_motor_constants.hpp>
 
+#include <controller/gravity_comp.hpp>
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -100,7 +102,9 @@ void init_arm(openarm::can::socket::OpenArm* arm) {
         {MotorType::DM8009, MotorType::DM8009, MotorType::DM4340, MotorType::DM4340,
          MotorType::DM4310, MotorType::DM4310, MotorType::DM4310},
         {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, {0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17});
-    arm->init_gripper_motor(MotorType::DM4310, 0x08, 0x18);
+    if (!env_requests_no_gripper()) {
+        arm->init_gripper_motor(MotorType::DM4310, 0x08, 0x18);
+    }
 }
 
 using ParamTable = std::vector<std::vector<double>>;  // [motor][rid_index]

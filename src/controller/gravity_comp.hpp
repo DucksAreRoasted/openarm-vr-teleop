@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -23,8 +24,12 @@ struct GravityTune {
 struct GravityModel {
     double urdf_scale = 1.0;
     double ee_payload_kg = 0.0;
-    // Shared gripper-motor mass (joint 8). Fingers are already in the URDF point mass.
+    // Joint-8 motor mass. An explicit 0 stays 0; the 0.12 default applies only when the
+    // yaml key is omitted. Finger mass is separate and is added only while the gripper
+    // is installed and present on the bus.
     double gripper_motor_kg = 0.12;
+    // false: fingers and the gripper motor are physically off the arm.
+    bool gripper_installed = true;
     // Depth camera + bracket on the wrist (link7 frame). Off-axis COM torques j5/j6/j7.
     double wrist_camera_kg = 0.12;
     // Optional per-arm camera COM in link7 [m]. NaN → Dynamics default (±Y, +Z).
@@ -71,6 +76,29 @@ inline const std::array<double, 7>& link_mass_scales_for(const GravityModel& mod
 inline const std::array<double, 21>& link_com_deltas_for(const GravityModel& model,
                                                          const std::string& side) {
     return (side == "left") ? model.left_link_com_delta : model.right_link_com_delta;
+}
+
+// Two finger links in assets/v1.urdf. They sit past link7, so KDL does not include them.
+inline constexpr double kOpenArmFingerMassKg = 2.0 * 0.03602545343277134;
+inline constexpr double kOpenArmFingerComZ = 0.1025 + 0.045;
+
+inline bool env_requests_no_gripper() {
+    const char* value = std::getenv("OPENARM_NO_GRIPPER");
+    return value != nullptr && std::string(value) == "1";
+}
+
+inline bool gripper_configured_installed(const GravityModel& model) {
+    return model.gripper_installed && !env_requests_no_gripper();
+}
+
+// gripper_on_robot is false when config says so, or when the 0x08 motor never answers.
+// Payload and the wrist camera stay; only the removed gripper (fingers + its motor) drops out.
+inline double end_effector_point_mass_kg(const GravityModel& model, bool gripper_on_robot) {
+    const double payload = std::max(0.0, model.ee_payload_kg);
+    if (!gripper_on_robot) {
+        return payload;
+    }
+    return kOpenArmFingerMassKg + std::max(0.0, model.gripper_motor_kg) + payload;
 }
 
 // OpenArmX TAU_LIMITS (Nm): proximal RS04-class, mid RS03, wrist RS00.
@@ -189,6 +217,12 @@ inline bool load_gravity_yaml(const std::string& path, GravityTune* left, Gravit
             take_scalar("urdf_gravity_scale", &model->urdf_scale);
             take_scalar("ee_payload_kg", &model->ee_payload_kg);
             take_scalar("gripper_motor_kg", &model->gripper_motor_kg);
+            if (line.rfind("gripper_installed:", 0) == 0) {
+                const std::string value =
+                    trim_ws(line.substr(std::string("gripper_installed:").size()));
+                model->gripper_installed = value == "1" || value == "true" || value == "True" ||
+                                           value == "yes" || value == "Yes";
+            }
             take_scalar("wrist_camera_kg", &model->wrist_camera_kg);
             take_scalar("wrist_zero_g_kd", &model->wrist_zero_g_kd);
             take_scalar("gripper_friction_fc", &model->gripper_friction_fc);

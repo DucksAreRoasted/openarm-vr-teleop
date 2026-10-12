@@ -6,6 +6,7 @@
 
 #include <controller/dynamics.hpp>
 #include <controller/gravity_comp.hpp>
+#include <openarm_port/gripper_probe.hpp>
 
 #include <algorithm>
 #include <array>
@@ -49,22 +50,16 @@ constexpr double kFaultHoldS = 0.30;     // single-sample velocity glitches must
 std::atomic<bool> g_running{true};
 void on_signal(int) { g_running = false; }
 
-constexpr double kFingerMassKg = 2.0 * 0.03602545343277134;
-constexpr double kGripperMotorKgDefault = 0.12;
-constexpr double kFingerComX = 0.0;
-constexpr double kFingerComY = 0.0;
-constexpr double kFingerComZ = 0.1025 + 0.045;
-
-void apply_gravity_model(Dynamics* dynamics, const GravityModel& model, const std::string& side) {
+void apply_gravity_model(Dynamics* dynamics, const GravityModel& model, const std::string& side,
+                         bool gripper_on) {
     if (dynamics == nullptr) {
         return;
     }
     dynamics->SetLinkMassScales(link_mass_scales_for(model, side));
     dynamics->SetLinkComDeltas(link_com_deltas_for(model, side));
     dynamics->SetUrdfGravityScale(model.urdf_scale);
-    const double motor = model.gripper_motor_kg > 0.0 ? model.gripper_motor_kg : kGripperMotorKgDefault;
-    dynamics->SetEndEffectorPointMass(kFingerMassKg + motor + model.ee_payload_kg, kFingerComX,
-                                      kFingerComY, kFingerComZ);
+    dynamics->SetEndEffectorPointMass(end_effector_point_mass_kg(model, gripper_on), 0.0, 0.0,
+                                      kOpenArmFingerComZ);
     const auto& off =
         (side == "left") ? model.wrist_camera_offset_left : model.wrist_camera_offset_right;
     dynamics->SetWristCameraMass(model.wrist_camera_kg, side == "left", off[0], off[1], off[2]);
@@ -250,15 +245,26 @@ public:
             openarm::damiao_motor::MotorType::DM4310};
         hardware_->init_arm_motors(types, {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
                                    {0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17});
-        hardware_->init_gripper_motor(openarm::damiao_motor::MotorType::DM4310, 0x08, 0x18);
+        const bool configured = gripper_configured_installed(model);
+        if (configured) {
+            hardware_->init_gripper_motor(openarm::damiao_motor::MotorType::DM4310, 0x08, 0x18);
+        }
         hardware_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
         hardware_->enable_all();
         enabled_ = true;
+        bool saw_gripper = false;
         for (int cycle = 0; cycle < 20; ++cycle) {
             hardware_->refresh_all();
             hardware_->recv_all(2000);
+            if (configured && openarm_init::gripper_reported_state(hardware_.get())) {
+                saw_gripper = true;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+        if (configured && !saw_gripper) {
+            saw_gripper = openarm_init::poll_gripper_state(hardware_.get(), 180);
+        }
+        gripper_on_ = configured && saw_gripper;
         dynamics_ = std::make_unique<Dynamics>(urdf, "openarm_body_link0",
                                                "openarm_" + side_ + "_link7");
         dynamics_->SetLinkMassScales(link_mass_scales_for(model, side_));
@@ -267,11 +273,20 @@ public:
             dynamics_.reset();
             throw std::runtime_error(side_ + " 重力模型初始化失败");
         }
-        apply_gravity_model(dynamics_.get(), model, side_);
+        apply_gravity_model(dynamics_.get(), model, side_, gripper_on_);
         read();
         gripper_hold_ = gripper_;
         command_ = measured_;
-        std::cout << "[calib] " << side_ << " 就绪 can=" << can << std::endl;
+        if (!gripper_on_) {
+            std::cout << "[calib] " << side_
+                      << " 按无夹爪继续：不下发 0x08，重力不含指尖和夹爪电机质量。"
+                      << (configured ? "总线上没有 0x18 反馈。"
+                                     : "OPENARM_NO_GRIPPER=1 或 gripper_installed: false。")
+                      << std::endl;
+        }
+        std::cout << "[calib] " << side_ << " 就绪 can=" << can
+                  << " ee_kg=" << end_effector_point_mass_kg(model, gripper_on_)
+                  << " gripper=" << (gripper_on_ ? "on" : "off") << std::endl;
     }
 
     ~ArmCalib() {
@@ -360,7 +375,9 @@ public:
                 {kp[index], kd[index], command_[index], command_vel_[index], tau_ff[index]});
         }
         hardware_->get_arm().mit_control_all(arm);
-        hardware_->get_gripper().mit_control_all({{0.0, 0.2, gripper_hold_, 0.0, 0.0}});
+        if (gripper_on_) {
+            hardware_->get_gripper().mit_control_all({{0.0, 0.2, gripper_hold_, 0.0, 0.0}});
+        }
         hardware_->recv_all(1000);
         read_locked();
         const double dt = have_sample_ ? (t_sec - prev_t_) : 0.0;
@@ -423,9 +440,11 @@ private:
             measured_vel_[index] = motors[index].get_velocity();
             measured_tau_[index] = motors[index].get_torque();
         }
-        const auto gripper = hardware_->get_gripper().get_motors();
-        if (!gripper.empty()) {
-            gripper_ = gripper.front().get_position();
+        if (gripper_on_) {
+            const auto gripper = hardware_->get_gripper().get_motors();
+            if (!gripper.empty()) {
+                gripper_ = gripper.front().get_position();
+            }
         }
     }
 
@@ -443,6 +462,7 @@ private:
     Pose command_vel_{};
     double gripper_ = 0.0;
     double gripper_hold_ = 0.0;
+    bool gripper_on_ = true;
     bool enabled_ = false;
     bool soft_hold_ = false;
     bool logging_ = false;

@@ -14,6 +14,7 @@ Camera / distal / friction knobs already in yaml are preserved (merge write).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -64,11 +65,22 @@ def main() -> None:
         action="store_true",
         help="同时把摩擦重置为保守默认（默认保留原有摩擦）",
     )
+    parser.add_argument(
+        "--no-gripper",
+        action="store_true",
+        help="夹爪已卸下：初值不含指尖质量，并写入 gripper_installed: false、gripper_motor_kg: 0",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印 URDF 初值，不写 yaml")
     args = parser.parse_args()
 
+    existing = load_params(args.write) if args.write.is_file() else {}
     if args.ee_payload is None:
-        args.ee_payload = float(load_params(args.write).get("ee_payload_kg", 0.0))
+        args.ee_payload = float(existing.get("ee_payload_kg", 0.0))
+    gripper_installed = not (
+        args.no_gripper
+        or os.environ.get("OPENARM_NO_GRIPPER") == "1"
+        or existing.get("gripper_installed") is False
+    )
 
     if not args.urdf.is_file():
         raise SystemExit(f"URDF 不存在：{args.urdf}")
@@ -81,7 +93,9 @@ def main() -> None:
     )
     print(f"URDF：{args.urdf}")
 
-    ee_mass = FINGER_MASS + float(args.ee_payload)
+    ee_mass = (FINGER_MASS if gripper_installed else 0.0) + float(args.ee_payload)
+    if not gripper_installed:
+        print("无夹爪：URDF 初值不含指尖质量，运行时也不下发夹爪电机 0x08")
     for side in ("left", "right"):
         g, backend, info = nominal_gravity_from_urdf(
             str(args.urdf), side, ee_mass=ee_mass
@@ -92,7 +106,8 @@ def main() -> None:
         print(f"  G_urdf(q)     = [{_fmt_tau(g)}] Nm")
         if abs(args.urdf_scale - 1.0) > 1e-9:
             print(f"  ×urdf_scale   = [{_fmt_tau(g_scaled)}] Nm  (scale={args.urdf_scale})")
-        print(f"  ee_mass (fingers+payload) = {ee_mass:.4f} kg")
+        label = "fingers+payload" if gripper_installed else "无夹爪，仅额外负载"
+        print(f"  ee_mass ({label}) = {ee_mass:.4f} kg")
 
     if args.dry_run:
         print("\n(--dry-run，未写入 yaml)")
@@ -113,6 +128,9 @@ def main() -> None:
         "left_gravity_bias": [0.0] * 7,
         "right_gravity_bias": [0.0] * 7,
     }
+    if not gripper_installed:
+        updates["gripper_installed"] = False
+        updates["gripper_motor_kg"] = 0.0
     if args.reset_friction:
         updates.update(
             {
@@ -129,8 +147,13 @@ def main() -> None:
         f"\n已写入 URDF 初值 → {args.write}\n"
         f"  纯 CAD：mass_scale=1, com_delta=0, joint scale/bias=1/0\n"
         f"  urdf_gravity_scale={args.urdf_scale} ee_payload={args.ee_payload} "
-        f"g_scale={args.g_scale}\n"
+        f"g_scale={args.g_scale} gripper_installed={gripper_installed}\n"
         f"  相机/远端增益等原有字段已保留。真机偏差再用「惯量标定」修正。"
+        + (
+            "\n  装回夹爪后把 gripper_installed 改回 true，并写回夹爪电机质量。"
+            if not gripper_installed
+            else ""
+        )
     )
 
 

@@ -87,6 +87,8 @@ struct MotorConfig {
     openarm::damiao_motor::MotorType gripper_motor_type;
     uint32_t gripper_send_can_id;
     uint32_t gripper_recv_can_id;
+    // false skips init_gripper_motor. Default keeps the installed-gripper path.
+    bool init_gripper = true;
 };
 
 // Global default motor configuration

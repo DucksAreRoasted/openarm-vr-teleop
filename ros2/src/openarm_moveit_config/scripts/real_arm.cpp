@@ -5,6 +5,7 @@
 #include <controller/dynamics.hpp>
 #include <controller/gravity_comp.hpp>
 #include <controller/s_curve.hpp>
+#include <openarm_port/gripper_probe.hpp>
 
 #include <algorithm>
 #include <array>
@@ -58,14 +59,8 @@ using GoalHandle = rclcpp_action::ServerGoalHandle<Follow>;
 #define OPENARM_ROOT ""
 #endif
 
-constexpr double kFingerMassKg = 2.0 * 0.03602545343277134;
-constexpr double kGripperMotorKgDefault = 0.12;
-constexpr double kFingerComX = 0.0;
-constexpr double kFingerComY = 0.0;
-constexpr double kFingerComZ = 0.1025 + 0.045;
-
 void apply_gravity_model(Dynamics* dynamics, const GravityModel& model, const std::string& side,
-                         bool reinit_links = false) {
+                         bool gripper_on, bool reinit_links = false) {
     if (dynamics == nullptr) {
         return;
     }
@@ -80,9 +75,8 @@ void apply_gravity_model(Dynamics* dynamics, const GravityModel& model, const st
         }
     }
     dynamics->SetUrdfGravityScale(model.urdf_scale);
-    const double motor = model.gripper_motor_kg > 0.0 ? model.gripper_motor_kg : kGripperMotorKgDefault;
-    dynamics->SetEndEffectorPointMass(kFingerMassKg + motor + model.ee_payload_kg, kFingerComX,
-                                      kFingerComY, kFingerComZ);
+    dynamics->SetEndEffectorPointMass(end_effector_point_mass_kg(model, gripper_on), 0.0, 0.0,
+                                      kOpenArmFingerComZ);
     const auto& off =
         (side == "left") ? model.wrist_camera_offset_left : model.wrist_camera_offset_right;
     dynamics->SetWristCameraMass(model.wrist_camera_kg, side == "left", off[0], off[1], off[2]);
@@ -280,14 +274,32 @@ public:
             openarm::damiao_motor::MotorType::DM4310};
         hardware_->init_arm_motors(types, {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
                                    {0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17});
-        hardware_->init_gripper_motor(openarm::damiao_motor::MotorType::DM4310, 0x08, 0x18);
+        const bool configured = gripper_configured_installed(model_);
+        if (configured) {
+            hardware_->init_gripper_motor(openarm::damiao_motor::MotorType::DM4310, 0x08, 0x18);
+        }
         hardware_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
         hardware_->enable_all();
         enabled_ = true;
+        bool saw_gripper = false;
         for (int cycle = 0; cycle < 20; ++cycle) {
             hardware_->refresh_all();
             hardware_->recv_all(2000);
+            if (configured && openarm_init::gripper_reported_state(hardware_.get())) {
+                saw_gripper = true;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (configured && !saw_gripper) {
+            saw_gripper = openarm_init::poll_gripper_state(hardware_.get(), 180);
+        }
+        gripper_on_ = configured && saw_gripper;
+        if (!gripper_on_) {
+            RCLCPP_WARN(rclcpp::get_logger("real_arm"),
+                        "%s 按无夹爪继续：不下发 0x08，重力不含指尖和夹爪电机质量。%s",
+                        side_.c_str(),
+                        configured ? "总线上没有 0x18 反馈。"
+                                   : "OPENARM_NO_GRIPPER=1 或 gripper_installed: false。");
         }
         dynamics_ = std::make_unique<Dynamics>(urdf_path, "openarm_body_link0",
                                                "openarm_" + side_ + "_link7");
@@ -296,7 +308,7 @@ public:
         if (!dynamics_->Init()) {
             dynamics_.reset();
         } else {
-            apply_gravity_model(dynamics_.get(), model_, side_);
+            apply_gravity_model(dynamics_.get(), model_, side_, gripper_on_);
         }
         read();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -323,7 +335,10 @@ public:
     void set_model(const GravityModel& model) {
         std::lock_guard<std::mutex> lock(mutex_);
         model_ = model;
-        apply_gravity_model(dynamics_.get(), model_, side_, /*reinit_links=*/true);
+        if (!gripper_configured_installed(model_)) {
+            gripper_on_ = false;
+        }
+        apply_gravity_model(dynamics_.get(), model_, side_, gripper_on_, /*reinit_links=*/true);
     }
 
     void set_tracking_ff_gain(double gain) {
@@ -466,9 +481,11 @@ private:
             measured_vel_[index] = motors[index].get_velocity();
             measured_tau_[index] = motors[index].get_torque();
         }
-        const auto gripper = hardware_->get_gripper().get_motors();
-        if (!gripper.empty()) {
-            gripper_ = gripper.front().get_position();
+        if (gripper_on_) {
+            const auto gripper = hardware_->get_gripper().get_motors();
+            if (!gripper.empty()) {
+                gripper_ = gripper.front().get_position();
+            }
         }
     }
 
@@ -510,7 +527,10 @@ private:
                 {KP[index], KD[index], command_[index], velocity_[index], tau_ff[index]});
         }
         hardware_->get_arm().mit_control_all(arm);
-        hardware_->get_gripper().mit_control_all({{GRIPPER_KP, GRIPPER_KD, gripper_hold_, 0.0, 0.0}});
+        if (gripper_on_) {
+            hardware_->get_gripper().mit_control_all(
+                {{GRIPPER_KP, GRIPPER_KD, gripper_hold_, 0.0, 0.0}});
+        }
         if (logger_ && (++log_div_ % 2) == 0) {
             logger_->write(t_sec, side_, trajectory_.active, command_, measured_, velocity_,
                            measured_vel_, gravity, tau_ff, measured_tau_);
@@ -570,6 +590,7 @@ private:
     std::array<double, 7> integral_tau_{};
     double gripper_ = 0.0;
     double gripper_hold_ = 0.0;
+    bool gripper_on_ = true;
     bool enabled_ = false;
     int log_div_ = 0;
     Trajectory trajectory_;
@@ -661,10 +682,10 @@ public:
 
         RCLCPP_INFO(get_logger(), "连接真机 CAN：左 %s，右 %s", left.c_str(), right.c_str());
         RCLCPP_INFO(get_logger(),
-                    "重力模型：urdf_scale=%.3f fingers+motor+payload=%.4f kg camera=%.3f kg "
-                    "tracking_g_scale=%.3f (+ hold integral)",
+                    "重力模型：urdf_scale=%.3f configured_ee=%.4f kg camera=%.3f kg "
+                    "tracking_g_scale=%.3f (+ hold integral)。夹爪不在总线上时会去掉指尖和夹爪电机质量",
                     model.urdf_scale,
-                    kFingerMassKg + model.gripper_motor_kg + model.ee_payload_kg,
+                    end_effector_point_mass_kg(model, gripper_configured_installed(model)),
                     model.wrist_camera_kg, model.tracking_ff_gain);
         arms_.emplace("left", std::make_unique<ArmBus>(left, "left", urdf, left_tune, model,
                                                        model.tracking_ff_gain, logger));

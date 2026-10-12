@@ -22,7 +22,8 @@ public:
                       const GravityTune& tune, const GravityModel& model,
                       std::shared_ptr<MujocoSimWorld> world = nullptr, bool replay_follower = false)
         : side_(side), can_name_(can), dynamics_(urdf, "openarm_body_link0", "openarm_" + side + "_link7"),
-          tune_(tune), model_(model), follower_feedback_(side == "left" || replay_follower) {
+          tune_(tune), model_(model), follower_feedback_(side == "left" || replay_follower),
+          gripper_on_(gripper_configured_installed(model)) {
         prepare_friction();
         apply_model(false);
         if (!dynamics_.Init()) throw std::runtime_error("mirror: gravity model init failed");
@@ -41,7 +42,9 @@ public:
             lower[7] = 0; upper[7] = 0.044;
         } else {
             // Initialize into neutral measured-position commands; no homing motion.
-            can_.reset(openarm_init::OpenArmInitializer::initialize_openarm(can, false));
+            MotorConfig config = DEFAULT_MOTOR_CONFIG;
+            config.init_gripper = gripper_on_;
+            can_.reset(openarm_init::OpenArmInitializer::initialize_openarm(can, config, false));
             std::cout << "[mirror] " << side_ << " can=" << can_name_
                       << " transport=CAN-FD (debug logging disabled)" << std::endl;
             hardware_ = std::make_shared<CanTeleopHardware>(can_.get());
@@ -66,15 +69,21 @@ public:
         hardware_->recv_all(1000);
         if (can_) {
             validate_feedback(can_->get_arm().get_motors());
-            validate_feedback(can_->get_gripper().get_motors());
+            if (gripper_on_) validate_feedback(can_->get_gripper().get_motors());
         }
         const auto arm = hardware_->read_arm();
-        const auto grip = hardware_->read_gripper();
-        if (arm.size() != 7 || grip.size() != 1) throw std::runtime_error("mirror: expected 7+1 motors");
+        if (arm.size() != 7) throw std::runtime_error("mirror: expected 7 arm motors");
         measured.clear();
         for (const auto& m : arm) measured.push_back({m.position, m.velocity, m.effort});
-        measured.push_back({grip[0].position, grip[0].velocity, grip[0].effort});
-        for (size_t i = 0; i < 8; ++i) {
+        if (gripper_on_) {
+            const auto grip = hardware_->read_gripper();
+            if (grip.size() != 1) throw std::runtime_error("mirror: expected 7+1 motors");
+            measured.push_back({grip[0].position, grip[0].velocity, grip[0].effort});
+        } else {
+            measured.push_back({0, 0, 0});
+        }
+        const size_t checked = gripper_on_ ? 8 : 7;
+        for (size_t i = 0; i < checked; ++i) {
             const auto& m = measured[i];
             validate_mirror_feedback(side_, !follower_feedback_, i,
                                      m.position, m.velocity, m.effort, lower[i], upper[i]);
@@ -134,30 +143,38 @@ public:
             // Right master has no position spring: measured pose is the demonstrated action.
             frame[i] = {pos, follower ? vel : measured[i].velocity, tau};
         }
-        const double grip_pos = follower ? target[7] : q[7];
-        const double grip_vel = follower ? velocity[7] : 0;
-        if (!std::isfinite(grip_pos) || !std::isfinite(grip_vel) ||
-            (follower && (grip_pos < lower[7] || grip_pos > upper[7] ||
-                          std::abs(grip_pos-q[7]) > .201))) {
-            std::ostringstream error;
-            error << "mirror: invalid gripper command on " << side_ << " target=" << grip_pos
-                  << " measured=" << q[7] << " velocity=" << grip_vel << " max_lead=0.2";
-            throw std::runtime_error(error.str());
+        openarm::damiao_motor::MITParam grip_cmd{};
+        if (gripper_on_) {
+            const double grip_pos = follower ? target[7] : q[7];
+            const double grip_vel = follower ? velocity[7] : 0;
+            if (!std::isfinite(grip_pos) || !std::isfinite(grip_vel) ||
+                (follower && (grip_pos < lower[7] || grip_pos > upper[7] ||
+                              std::abs(grip_pos-q[7]) > .201))) {
+                std::ostringstream error;
+                error << "mirror: invalid gripper command on " << side_ << " target=" << grip_pos
+                      << " measured=" << q[7] << " velocity=" << grip_vel << " max_lead=0.2";
+                throw std::runtime_error(error.str());
+            }
+            const double gp = follower ? 6.0 : 0;
+            const double gd = follower ? 0.45 : 0;
+            const double gpd = gp * (grip_pos-q[7]) + gd * (grip_vel-measured[7].velocity);
+            double gtau = friction_torque(measured[7].velocity, model_.gripper_friction_fc,
+                                         model_.gripper_friction_fv, model_.gripper_friction_k);
+            if (!std::isfinite(gtau)) throw std::runtime_error("mirror: invalid gripper friction torque");
+            gtau = std::clamp(gtau + gpd, -1.0, 1.0) - gpd;
+            grip_cmd = {gp, gd, grip_pos, grip_vel, gtau};
+            frame[7] = {grip_pos, follower ? grip_vel : measured[7].velocity, gtau};
+        } else {
+            frame[7] = {0, 0, 0};
         }
-        const double gp = follower ? 6.0 : 0;
-        const double gd = follower ? 0.45 : 0;
-        const double gpd = gp * (grip_pos-q[7]) + gd * (grip_vel-measured[7].velocity);
-        double gtau = friction_torque(measured[7].velocity, model_.gripper_friction_fc,
-                                     model_.gripper_friction_fv, model_.gripper_friction_k);
-        if (!std::isfinite(gtau)) throw std::runtime_error("mirror: invalid gripper friction torque");
-        gtau = std::clamp(gtau + gpd, -1.0, 1.0) - gpd;
         // All checks finish before sending anything on this arm.
         hardware_->send_arm(commands);
-        hardware_->send_gripper({{gp, gd, grip_pos, grip_vel, gtau}});
-        frame[7] = {grip_pos, follower ? grip_vel : measured[7].velocity, gtau};
+        if (gripper_on_) hardware_->send_gripper({grip_cmd});
     }
     void reload(const GravityTune& tune, const GravityModel& model) {
-        tune_ = tune; model_ = model; prepare_friction(); apply_model(true);
+        tune_ = tune; model_ = model; prepare_friction();
+        if (!gripper_configured_installed(model_)) gripper_on_ = false;
+        apply_model(true);
     }
     void set_sim_master(const Pose& q, const Pose& dq = {}) {
         if (!sim_) throw std::runtime_error("mirror: simulation demo is simulation-only");
@@ -184,14 +201,35 @@ private:
             }
             try {
                 validate_feedback(can_->get_arm().get_motors());
-                validate_feedback(can_->get_gripper().get_motors());
-                std::cout << "[mirror] " << side_ << " can=" << can_name_
-                          << " all 8 motors have fresh feedback" << std::endl;
+                if (gripper_on_) validate_feedback(can_->get_gripper().get_motors());
+                std::cout << "[mirror] " << side_ << " can=" << can_name_ << " "
+                          << (gripper_on_ ? "all 8 motors have fresh feedback"
+                                          : "7 arm motors have fresh feedback, gripper off")
+                          << std::endl;
                 return;
             } catch (const std::exception& error) {
                 last_error = error.what();
             }
         } while (std::chrono::steady_clock::now() < deadline);
+        try {
+            validate_feedback(can_->get_arm().get_motors());
+        } catch (const std::exception& error) {
+            throw std::runtime_error("mirror: startup feedback wait failed (1s): " + error.what());
+        }
+        if (!gripper_on_) {
+            return;
+        }
+        const auto grippers = can_->get_gripper().get_motors();
+        const bool missing = grippers.empty() ||
+                             grippers.front().last_state_received().time_since_epoch().count() == 0;
+        if (missing) {
+            gripper_on_ = false;
+            apply_model(false);
+            std::cout << "[mirror] " << side_ << " can=" << can_name_
+                      << " 夹爪电机无反馈（" << last_error
+                      << "），按无夹爪继续：不下发 0x08，重力不含指尖和夹爪电机质量" << std::endl;
+            return;
+        }
         throw std::runtime_error("mirror: startup feedback wait failed (1s): " + last_error);
     }
     void prepare_friction() {
@@ -232,8 +270,8 @@ private:
         dynamics_.SetLinkComDeltas(link_com_deltas_for(model_, side_));
         if (reinit && !dynamics_.ReinitWithMassScales(scales)) throw std::runtime_error("mirror: model reload failed");
         dynamics_.SetUrdfGravityScale(model_.urdf_scale);
-        const double motor = model_.gripper_motor_kg > 0 ? model_.gripper_motor_kg : 0.12;
-        dynamics_.SetEndEffectorPointMass(2 * 0.03602545343277134 + motor + model_.ee_payload_kg, 0, 0, 0.1475);
+        dynamics_.SetEndEffectorPointMass(end_effector_point_mass_kg(model_, gripper_on_), 0, 0,
+                                          kOpenArmFingerComZ);
         const auto& off = side_ == "left" ? model_.wrist_camera_offset_left : model_.wrist_camera_offset_right;
         dynamics_.SetWristCameraMass(model_.wrist_camera_kg, side_ == "left", off[0], off[1], off[2]);
         dynamics_.SetDistalMassGains(model_.distal_ee_gain, model_.distal_cam_gain);
@@ -244,6 +282,7 @@ private:
     GravityTune tune_;
     GravityModel model_;
     bool follower_feedback_;
+    bool gripper_on_;
     std::unique_ptr<openarm::can::socket::OpenArm> can_;
     std::shared_ptr<MujocoTeleopHardware> sim_;
     std::shared_ptr<TeleopHardware> hardware_;
