@@ -52,6 +52,7 @@ from .services import (
     camera_view_open,
     configure_can,
     local_ip,
+    quest_udp_host,
     send_record,
     sudo_is_cached,
 )
@@ -108,10 +109,19 @@ class MainWindow(QMainWindow):
         self._poll_timer.setInterval(400)
         self._capture_socket = QUdpSocket(self)
         capture_port = int(os.environ.get("OPENARM_QUEST_CAPTURE_PORT", "47934"))
-        if self._capture_socket.bind(QHostAddress.SpecialAddress.LocalHost, capture_port):
+        capture_host = quest_udp_host()
+        if capture_host == "0.0.0.0":
+            capture_address = QHostAddress(QHostAddress.SpecialAddress.AnyIPv4)
+        elif capture_host == "127.0.0.1":
+            capture_address = QHostAddress(QHostAddress.SpecialAddress.LocalHost)
+        else:
+            capture_address = QHostAddress(capture_host)
+        if not capture_address.isNull() and self._capture_socket.bind(capture_address, capture_port):
             self._capture_socket.readyRead.connect(self._capture_shortcut)
         else:
-            self.record_hint.setText(f"手柄采集快捷键不可用：端口 {capture_port} 已占用。")
+            self.record_hint.setText(
+                f"手柄采集快捷键不可用：{capture_host}:{capture_port} 无法绑定。"
+            )
 
     def _capture_shortcut(self) -> None:
         while self._capture_socket.hasPendingDatagrams():
