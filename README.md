@@ -72,7 +72,7 @@ RViz 默认使用系统图形驱动，显示刷新率设为 30 FPS。若报 `Una
 
 日志：`recordings/gravity/`；电机参数：`recordings/motor_params/`。真机启动会调 `scripts/configure_can.sh`（默认左 `can1`、右 `can0`，1M / 5M CAN FD），需 sudo。
 
-仿真会打开 MuJoCo 窗口。Quest 浏览器打开 `https://<这台电脑的IP>:8443`（证书在 `quest/`）。左手 UDP `47912`，右手 `47911`。
+仿真会打开 MuJoCo 窗口。Quest 浏览器打开 `https://<这台电脑的IP>:8443`（证书在 `quest/`）。网页 `8443` 和 WebSocket `8442` 仍监听局域网，头显从另一台设备连入。桥再把左手 UDP `47912`、右手 `47911`、骨骼 `47951` 发给控制程序；控制端这些口以及肘部 hint `47950`、身体关键点 `47952` 默认只绑定 `127.0.0.1`。桥和控制程序要在同一台电脑，否则控制端收不到姿态，日志里会一直停在等待 UDP。跨机时设置 `OPENARM_QUEST_UDP_HOST`：控制端填 `0.0.0.0`（监听所有网卡）或本机网卡地址，桥填控制电脑的 IPv4。发给 `0.0.0.0` 的包仍留在桥所在的电脑上。
 
 **肘部与腕部追踪**：控制台勾选“Quest 肘部与腕部追踪”，或使用 `./run.sh --skeleton --sim`。持续追踪肘部和腕部，肩点仅在进入沉浸模式时校准；需要浏览器提供 WebXR 身体关节数据。短暂丢帧冻结并重新接入，持续丢失后需重新握持 Grip。逆解限制约 60 Hz，关节参考仍按原控制频率更新。先验证仿真，操作与限制见 [Quest 肩肘骨骼追踪](docs/Quest肩肘骨骼追踪.md)。
 
@@ -93,6 +93,7 @@ VR 真机遥操默认先沿 `assets/steady_action_on_table.csv` 进入桌面姿�
 | --- | --- | --- |
 | `VR_TELEOP_MODE` | `human_mimic` | `human_mimic` / `cartesian_precision` / `skeleton_proximal` / `pika_style` |
 | `VR_ORIENTATION` | `absolute` | `absolute` 或 `incremental` |
+| `OPENARM_QUEST_UDP_HOST` | `127.0.0.1` | Quest 桥发往控制程序的 UDP 地址，控制端绑定同一值。`0.0.0.0` 让控制端监听所有网卡；跨机时桥要填控制电脑的 IPv4，不要填 `0.0.0.0`。 |
 | `OPENARM_LEFT_FOLLOWER_CAN` | `can1` | 左臂 CAN |
 | `OPENARM_RIGHT_FOLLOWER_CAN` | `can0` | 右臂 CAN |
 | `OPENARM_HM_CLUTCH_START_DEG` | `2` | 握持后转过这么多度才开始跟姿态 |

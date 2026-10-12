@@ -1,6 +1,6 @@
 #include <io/quest_pose_receiver.hpp>
+#include <io/quest_udp_endpoint.hpp>
 
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -28,18 +28,15 @@ bool QuestPoseReceiver::open(uint16_t port) {
     int flags = fcntl(fd_, F_GETFL, 0);
     fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
 
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-    if (bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        std::cerr << "[quest-pose] bind failed on port " << port << ": "
+    std::string bound_host;
+    if (!bind_quest_udp(fd_, port, &bound_host)) {
+        std::cerr << "[quest-pose] bind failed on " << quest_udp_host() << ":" << port << ": "
                   << std::strerror(errno) << std::endl;
         close();
         return false;
     }
 
-    std::cout << "[quest-pose] listening on UDP port " << port << std::endl;
+    std::cout << "[quest-pose] listening on UDP " << bound_host << ":" << port << std::endl;
     return true;
 }
 

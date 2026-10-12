@@ -110,9 +110,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ "${START_BRIDGE}" == "1" ]]; then
+  # Headset page stays on 0.0.0.0. UDP to the control program is loopback unless
+  # OPENARM_QUEST_UDP_HOST is set (0.0.0.0 or a specific IPv4). The control
+  # process reads that same variable; this flag only sets the bridge target.
   "${PYTHON}" "${BRIDGE}" --host 0.0.0.0 \
     --http-port "${OPENARM_QUEST_HTTP_PORT:-8443}" \
     --ws-port "${OPENARM_QUEST_WS_PORT:-8442}" \
+    --udp-host "${OPENARM_QUEST_UDP_HOST:-127.0.0.1}" \
     --udp-left-port "${OPENARM_QUEST_PORT_LEFT:-47912}" \
     --udp-right-port "${OPENARM_QUEST_PORT_RIGHT:-47911}" &
   BRIDGE_PID=$!

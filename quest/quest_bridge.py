@@ -10,6 +10,10 @@ UDP payload format (CSV):
 
 Right controller -> --udp-right-port (default 47911)
 Left controller  -> --udp-left-port  (default 47912)
+
+The headset still reaches HTTPS/WebSocket on --host (default 0.0.0.0).
+UDP toward the control program defaults to 127.0.0.1. Override with
+--udp-host or OPENARM_QUEST_UDP_HOST (same variable the control program binds).
 """
 
 from __future__ import annotations
@@ -87,6 +91,18 @@ class HTTPRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:
         pass
+
+
+def quest_udp_host() -> str:
+    """IPv4 address shared with the control program's Quest UDP sockets."""
+    host = os.environ.get("OPENARM_QUEST_UDP_HOST", "").strip()
+    return host or "127.0.0.1"
+
+
+def resolve_udp_host(cli_value: Optional[str]) -> str:
+    if cli_value is not None and cli_value.strip():
+        return cli_value.strip()
+    return quest_udp_host()
 
 
 class QuestUdpForwarder:
@@ -176,7 +192,7 @@ class QuestBridge:
         host: str = "0.0.0.0",
         http_port: int = 8443,
         ws_port: int = 8442,
-        udp_host: str = "127.0.0.1",
+        udp_host: Optional[str] = None,
         udp_right_port: int = 47911,
         udp_left_port: int = 47912,
         bimanual: bool = True,
@@ -185,15 +201,18 @@ class QuestBridge:
         self.host = host
         self.http_port = http_port
         self.ws_port = ws_port
+        self.udp_host = resolve_udp_host(udp_host)
         self.log_interval = log_interval
         self.bimanual = bimanual
         self.client_connected = False
         self.right_stats = HandBridgeStats("right")
         self.left_stats = HandBridgeStats("left")
-        self.right_forwarder = QuestUdpForwarder(udp_host, udp_right_port, self.right_stats)
-        self.left_forwarder = QuestUdpForwarder(udp_host, udp_left_port, self.left_stats)
+        self.right_forwarder = QuestUdpForwarder(self.udp_host, udp_right_port, self.right_stats)
+        self.left_forwarder = QuestUdpForwarder(self.udp_host, udp_left_port, self.left_stats)
         self.skeleton_sock = None
-        self.skeleton_target = (udp_host, int(os.environ.get("OPENARM_SKELETON_POSE_PORT", "47951")))
+        self.skeleton_target = (
+            self.udp_host, int(os.environ.get("OPENARM_SKELETON_POSE_PORT", "47951"))
+        )
         if os.environ.get("VR_TELEOP_MODE") == "skeleton_proximal":
             self.skeleton_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ssl_context = create_self_signed_cert()
@@ -292,6 +311,8 @@ class QuestBridge:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
+            # Control -> bridge HUD. The sender is fixed at 127.0.0.1 and does not
+            # follow OPENARM_QUEST_UDP_HOST.
             sock.bind(("127.0.0.1", self.grip_telem_port))
         except OSError as exc:
             print(f"[quest-bridge] grip telem bind :{self.grip_telem_port} failed: {exc}", flush=True)
@@ -339,6 +360,14 @@ class QuestBridge:
             self.handle_client, self.host, self.ws_port, ssl=self.ssl_context
         ):
             print(f"WebSocket server: wss://{self.host}:{self.ws_port}", flush=True)
+            if self.udp_host == "0.0.0.0":
+                print(
+                    "[quest-bridge] udp host is 0.0.0.0: datagrams stay on this computer. "
+                    "To reach a control program on another machine, set --udp-host or "
+                    "OPENARM_QUEST_UDP_HOST to that machine's IPv4 address. On the control "
+                    "program, 0.0.0.0 listens on every interface.",
+                    flush=True,
+                )
             print(
                 f"Forwarding right-controller -> UDP "
                 f"{self.right_forwarder.target[0]}:{self.right_forwarder.target[1]}",
@@ -430,7 +459,13 @@ def main() -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=8443)
     parser.add_argument("--ws-port", type=int, default=8442)
-    parser.add_argument("--udp-host", default="127.0.0.1")
+    parser.add_argument(
+        "--udp-host",
+        default=None,
+        help="IPv4 address of the control program "
+             "(default 127.0.0.1, or OPENARM_QUEST_UDP_HOST). "
+             "0.0.0.0 only reaches this computer; use a concrete address across machines.",
+    )
     parser.add_argument("--udp-port", type=int, default=47911,
                         help="right-hand UDP port (single-arm legacy)")
     parser.add_argument("--udp-right-port", type=int, default=47911)
@@ -446,7 +481,7 @@ def main() -> int:
         host=args.host,
         http_port=args.http_port,
         ws_port=args.ws_port,
-        udp_host=args.udp_host,
+        udp_host=resolve_udp_host(args.udp_host),
         udp_right_port=args.udp_right_port if bimanual else args.udp_port,
         udp_left_port=args.udp_left_port,
         bimanual=bimanual,
