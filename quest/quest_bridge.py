@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 
 import websockets
 from body_tracking import skeleton_packet, skeleton_diagnostics
+from capture_shortcuts import CaptureShortcuts
 
 
 class ThreadingHTTPSServer(ThreadingMixIn, HTTPServer):
@@ -221,6 +222,9 @@ class QuestBridge:
         last_timestamp = -1
         last_skeleton_status = None
         last_skeleton_log = 0.0
+        shortcuts = CaptureShortcuts()
+        capture_lock = asyncio.Lock()
+        capture_tasks = set()
         try:
             async for message in websocket:
                 data = json.loads(message)
@@ -239,6 +243,16 @@ class QuestBridge:
                         last_skeleton_status, last_skeleton_log = status, now
                 right = data.get("rightController")
                 left = data.get("leftController")
+                for hand, controller in (("left", left), ("right", right)):
+                    action = shortcuts.update(hand, controller, time.monotonic())
+                    if action:
+                        if capture_tasks:
+                            await websocket.send(json.dumps({"type": "capture_feedback", "action": action,
+                                "ok": False, "message": "正在处理上一次采集操作，请稍后再按。"}, ensure_ascii=False))
+                        else:
+                            task = asyncio.create_task(self.capture_shortcut(websocket, action, capture_lock))
+                            capture_tasks.add(task)
+                            task.add_done_callback(capture_tasks.discard)
                 if right:
                     right["timestamp"] = timestamp
                     self.right_forwarder.send_controller(right)
@@ -251,8 +265,35 @@ class QuestBridge:
         except websockets.exceptions.ConnectionClosed:
             print("Quest client disconnected", flush=True)
         finally:
+            for task in capture_tasks:
+                task.cancel()
             self.ws_clients.discard(websocket)
             self.client_connected = bool(self.ws_clients)
+
+    async def capture_shortcut(self, websocket, action: str, lock: asyncio.Lock) -> None:
+        async with lock:
+            # A separate socket per request prevents late replies acknowledging another click.
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            loop = asyncio.get_running_loop()
+            payload = {"type": "capture_feedback", "action": action, "ok": False,
+                       "message": "未收到采集反馈，请在 ./app.sh 控制台核对状态。"}
+            try:
+                target = ("127.0.0.1", int(os.environ.get("OPENARM_QUEST_CAPTURE_PORT", "47934")))
+                sock.connect(target)
+                await loop.sock_sendall(sock, json.dumps({"action": action}).encode())
+                response = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout=.8)
+                reply = json.loads(response)
+                payload.update(ok=reply.get("ok") is True, message=str(reply.get("message", "")))
+            except (OSError, ValueError, asyncio.TimeoutError):
+                pass
+            finally:
+                sock.close()
+            print(f"[quest-capture] {action}: {payload['message']}", flush=True)
+            try:
+                await websocket.send(json.dumps(payload, ensure_ascii=False))
+            except websockets.exceptions.ConnectionClosed:
+                pass
 
     async def broadcast_json(self, payload: dict) -> None:
         if not self.ws_clients:

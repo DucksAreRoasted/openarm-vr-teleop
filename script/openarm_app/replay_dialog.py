@@ -14,7 +14,7 @@ from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
 )
 
 from .services import ROOT
@@ -59,11 +59,12 @@ class ReplayDialog(QDialog):
         self._error_text = ""
         self._playing = False
         self._complete = False
+        self._cycle = 1
         self._run_id = 0
         self._log_path: Path | None = None
         layout = QVBoxLayout(self)
         description = QLabel("先用 Quest 遥操、KER 或同向示教录制动作，停录并标注后，停止并释放控制器，再选择片段回放。\n"
-                             "回放驱动左右臂及夹爪；先慢速接入首帧，结束后保持末帧，点击停止才释放。")
+                             "回放驱动左右臂及夹爪；先慢速接入首帧。循环时慢速返回首帧，全部播放结束后保持末帧，点击停止才释放。")
         description.setWordWrap(True)
         layout.addWidget(description)
         paths = QHBoxLayout()
@@ -86,6 +87,14 @@ class ReplayDialog(QDialog):
         self._source_changed(source)
         options.addWidget(self.mode); options.addWidget(self.speed); options.addWidget(self.units)
         layout.addLayout(options)
+        repeats = QHBoxLayout()
+        repeats.addWidget(QLabel("播放次数（0 = 持续循环）"))
+        self.repeat = QSpinBox()
+        self.repeat.setRange(0, 10000)
+        self.repeat.setValue(1)
+        self.repeat.setToolTip("每遍结束后保持使能，慢速返回首帧，再播放下一遍；返回路径也须检查障碍物。")
+        repeats.addWidget(self.repeat)
+        layout.addLayout(repeats)
         self.safety = QCheckBox(f"真机确认：CAN 已配置（左 {left_can}、右 {right_can}），工作区清空，急停可用")
         layout.addWidget(self.safety)
         self.mode.currentIndexChanged.connect(self._update_controls)
@@ -123,7 +132,7 @@ class ReplayDialog(QDialog):
 
     def _update_controls(self, *_args) -> None:
         running = self._running()
-        for widget in (self.source, self.folder, self.file, self.mode, self.speed, self.units, self.safety):
+        for widget in (self.source, self.folder, self.file, self.mode, self.speed, self.units, self.safety, self.repeat):
             widget.setEnabled(not running)
         self.start.setEnabled(not running and (self.mode.currentIndex() == 0 or self.safety.isChecked()))
         self.pause.setEnabled(running and self._playing and not self._complete and not self._stopping)
@@ -161,10 +170,12 @@ class ReplayDialog(QDialog):
         self._run_id += 1
         self._buffer = ""; self._error_text = ""; self._paused = False
         self._stopping = False; self._complete = False; self._playing = False
+        self._cycle = 1
         self.pause.setText("暂停")
         command = [str(ROOT / "script/replay_teaching.py"), str(source.resolve()), "--real" if real else "--sim",
                    "--speed", str(self.speed.currentData()), "--left-can", self.left_can, "--right-can", self.right_can]
         if self.units.currentIndex() == 1: command.append("--source-meters")
+        command.extend(["--repeat", str(self.repeat.value())])
         self._log_path = Path(tempfile.gettempdir()) / (
             f"openarm_teaching_replay_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log")
         try:
@@ -197,14 +208,18 @@ class ReplayDialog(QDialog):
             line, self._buffer = self._buffer.split("\n", 1)
             self._append_log(line)
             if "[replay][ERROR]" in line: self._error_text = line
-            if "[replay] ALIGNING" in line: self.status.setText("正在慢速接入首帧…")
+            if "[replay] ALIGNING" in line:
+                self._playing = True
+                cycle = re.search(r"cycle=(\d+)", line)
+                if cycle: self._cycle = int(cycle[1])
+                self.status.setText("正在慢速接入首帧…")
             if "[replay] PLAYING" in line: self._playing = True
             match = re.search(r"PROGRESS time=([\d.e+-]+) duration=([\d.e+-]+) phase=(\w+)", line)
             if match and not self._stopping:
                 instant, duration = float(match[1]), float(match[2])
                 phase = {"aligning": "接入首帧", "playing": "回放中", "paused": "已暂停", "complete": "已完成，保持末帧"}[match[3]]
                 self.progress.setValue(int(1000*instant/duration) if duration > 0 else 0)
-                self.status.setText(f"{phase}  {instant:.1f} / {duration:.1f} 秒")
+                self.status.setText(f"第 {self._cycle} 遍 · {phase}  {instant:.1f} / {duration:.1f} 秒")
             if "[replay] COMPLETE" in line: self._complete = True
         self._update_controls()
 

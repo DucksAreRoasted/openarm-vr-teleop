@@ -32,6 +32,7 @@ int main(int argc, char** argv) {
     try {
         bool simulation = true, source_meters = false, check_only = false;
         double speed = .5;
+        int repeat = 1, cycle = 1;
         std::string csv, urdf = "assets/v1.urdf", xml, yaml = "config/gravity_comp.yaml";
         std::string left_can = "can1", right_can = "can0";
         for (int i = 1; i < argc; ++i) {
@@ -44,6 +45,12 @@ int main(int argc, char** argv) {
             else if (arg == "--left-can") left_can = value();
             else if (arg == "--right-can") right_can = value();
             else if (arg == "--speed") speed = std::stod(value());
+            else if (arg == "--repeat") {
+                const auto text = value();
+                size_t end = 0;
+                repeat = std::stoi(text, &end);
+                if (end != text.size() || repeat < 0) throw std::runtime_error("repeat must be a nonnegative integer");
+            }
             else if (arg == "--source-meters") source_meters = true;
             else if (arg == "--sim") simulation = true;
             else if (arg == "--real") simulation = false;
@@ -124,11 +131,15 @@ int main(int argc, char** argv) {
             const bool catching_up = arm_error(goal.position, reference.position()) > .03;
             for (auto& v : goal.velocity) v *= (!aligning && !paused && !complete && !catching_up) ? speed : 0;
             const auto measured = join(left.pose(), right.pose());
+            if (paused) {
+                goal.position = reference.position();
+                goal.velocity.fill(0);
+            }
             reference.step(goal, measured, join(left.velocity(), right.velocity()), dt, aligning);
             left.send(half(reference.position(), 0), half(reference.velocity(), 0), true);
             right.send(half(reference.position(), 8), half(reference.velocity(), 8), true);
-            phase_time += dt;
-            if (aligning) {
+            if (!paused) phase_time += dt;
+            if (aligning && !paused) {
                 if (phase_time > 120) throw std::runtime_error("alignment timed out");
                 if (arm_error(goal.position, reference.position()) < .015 && arm_error(goal.position, measured) < .12) {
                     aligning = false; phase_time = 0;
@@ -140,14 +151,22 @@ int main(int argc, char** argv) {
                     const bool at_end = arm_error(goal.position, reference.position()) < .015 && arm_error(goal.position, measured) < .12;
                     settled = at_end ? settled+dt : 0;
                     if (settled > .3) {
-                        complete = true;
-                        std::cout << "[replay] COMPLETE: holding final pose; Stop releases both arms" << std::endl;
+                        if (repeat == 0 || cycle < repeat) {
+                            ++cycle;
+                            position = 0; phase_time = 0; settled = 0;
+                            aligning = true;
+                            std::cout << "[replay] ALIGNING: cycle=" << cycle
+                                      << " slow return to first frame" << std::endl;
+                        } else {
+                            complete = true;
+                            std::cout << "[replay] COMPLETE: holding final pose; Stop releases both arms" << std::endl;
+                        }
                     }
                 }
             }
             if (now >= next_log) {
                 std::cout << "[replay] PROGRESS time=" << position << " duration=" << trajectory.duration()
-                          << " phase=" << (aligning ? "aligning" : complete ? "complete" : paused ? "paused" : "playing")
+                          << " phase=" << (complete ? "complete" : paused ? "paused" : aligning ? "aligning" : "playing")
                           << " error=" << arm_error(goal.position, measured) << std::endl;
                 next_log = now+std::chrono::milliseconds(500);
             }

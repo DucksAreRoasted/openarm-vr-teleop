@@ -67,11 +67,12 @@
 <body>
     <div id="main-container" class="container">
         <h1>Quest 3 Passthrough Data Client</h1>
-        <p style="text-align:center;color:#666;">client v24 — 肘部与腕部追踪 / A/B/X/Y 夹爪控制</p>
+        <p style="text-align:center;color:#666;">client v25 — 肘部与腕部追踪 / 夹爪控制 / 手柄采集</p>
         
         <div id="webxrStatus" class="webxr-status webxr-not-supported">Checking WebXR support...</div>
         
         <div id="status" class="status disconnected">Disconnected</div>
+        <div id="captureStatus" role="status">采集：左摇杆短按开始/停止，长按重录；停录后右摇杆短按成功、长按失败。长按 1 秒后松开。需先运行 ./app.sh 并填写批次名。</div>
         
         <div class="warning">
             <strong>Important:</strong> Open this page through HTTPS (or localhost) in the Quest browser to enable passthrough.
@@ -182,6 +183,20 @@
                 websocket.onopen = () => { console.log(`WS Connected`); updateStatus(true); };
                 websocket.onerror = (e) => { console.error(`WS Error:`, e); updateStatus(false); };
                 websocket.onclose = () => { updateStatus(false); };
+                websocket.onmessage = async (event) => {
+                    let message;
+                    try { message = JSON.parse(event.data); } catch { return; }
+                    if (message.type !== 'capture_feedback') return;
+                    document.getElementById('captureStatus').textContent = message.message;
+                    const hand = message.action.startsWith('left-') ? 'left' : 'right';
+                    const source = Array.from(xrSession?.inputSources || []).find(item => item.handedness === hand);
+                    const actuator = source?.gamepad?.hapticActuators?.[0];
+                    if (actuator) {
+                        try {
+                            await actuator.pulse(message.ok ? .5 : 1, message.ok ? 120 : 350);
+                        } catch { /* Some browsers expose an actuator without supporting pulse. */ }
+                    }
+                };
             } catch (error) {
                 console.error(`WS Connect Failed:`, error);
                 updateStatus(false);
@@ -357,7 +372,9 @@
                                     gripActive: grip,
                                     trigger: trigger,
                                     buttonClose: buttonClose,
-                                    buttonOpen: buttonOpen
+                                    buttonOpen: buttonOpen,
+                                    stickPressed: inputSource.gamepad?.buttons.length >= 6
+                                        ? !!inputSource.gamepad.buttons[3].pressed : undefined
                                 };
 
                                 if (refreshDisplays) updateControllerDisplay(inputSource.handedness, controllerInfo.position, controllerInfo.rotation, grip, trigger, buttonClose, buttonOpen);

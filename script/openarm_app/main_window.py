@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import signal
@@ -13,6 +14,7 @@ import threading
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QTextCursor
+from PySide6.QtNetwork import QHostAddress, QUdpSocket
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -103,6 +105,40 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.setInterval(400)
+        self._capture_socket = QUdpSocket(self)
+        capture_port = int(os.environ.get("OPENARM_QUEST_CAPTURE_PORT", "47934"))
+        if self._capture_socket.bind(QHostAddress.SpecialAddress.LocalHost, capture_port):
+            self._capture_socket.readyRead.connect(self._capture_shortcut)
+        else:
+            self.record_hint.setText(f"手柄采集快捷键不可用：端口 {capture_port} 已占用。")
+
+    def _capture_shortcut(self) -> None:
+        while self._capture_socket.hasPendingDatagrams():
+            datagram = self._capture_socket.receiveDatagram()
+            ok = False
+            message = "当前不能执行此采集操作，请检查录制状态。"
+            try:
+                action = json.loads(bytes(datagram.data())).get("action")
+                button = {
+                    "left-short": self.rec_stop if self._recording else self.rec_start,
+                    "left-long": self.rec_redo,
+                    "right-short": self.rec_ok,
+                    "right-long": self.rec_bad,
+                }.get(action)
+                if (self._mode() in ("sim", "real") and self._record_available()
+                        and button is not None and button.isEnabled()
+                        and not (action == "left-long" and self._recording)):
+                    if action == "left-short" and not self._recording and not self.batch_edit.text().strip():
+                        message = "请先在控制台填写批次名称。"
+                    else:
+                        kind = {"left-short": "stop" if self._recording else "start",
+                                "left-long": "redo", "right-short": "success", "right-long": "fail"}[action]
+                        ok = self._record(kind, quiet=True)
+                        message = self.record_hint.text()
+            except (ValueError, AttributeError, TypeError):
+                message = "无效的采集快捷键请求。"
+            reply = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode()
+            self._capture_socket.writeDatagram(reply, datagram.senderAddress(), datagram.senderPort())
 
     def _build(self) -> None:
         central = QWidget()
@@ -352,6 +388,10 @@ class MainWindow(QMainWindow):
         self.record_hint.setObjectName("Hint")
         self.record_hint.setWordWrap(True)
         r_layout.addWidget(self.record_hint)
+        shortcuts_hint = QLabel("Quest 摇杆按下：左短按开始/停止，左长按重录；停录后右短按成功、右长按失败。长按 1 秒后松开。")
+        shortcuts_hint.setWordWrap(True)
+        shortcuts_hint.setObjectName("Hint")
+        r_layout.addWidget(shortcuts_hint)
         right.addWidget(record)
 
         self.btn_refresh_usb.setToolTip('重新扫描 USB 相机设备，更新设备列表。')
@@ -472,12 +512,12 @@ class MainWindow(QMainWindow):
         elif self._mode() in ("real", "moveit", "zerog", "mirror", "ker_real"):
             self._set_can_enabled(True)
         teleop = self._record_available()
-        self.rec_start.setEnabled(teleop and not self._awaiting_label)
-        self.rec_stop.setEnabled(False)
+        self.rec_start.setEnabled(teleop and not self._awaiting_label and not self._recording)
+        self.rec_stop.setEnabled(teleop and self._recording)
         self.rec_ok.setEnabled(teleop and self._awaiting_label)
         self.rec_bad.setEnabled(teleop and self._awaiting_label)
-        self.rec_redo.setEnabled(teleop and self._can_redo)
-        self.batch_edit.setEnabled(teleop and not self._awaiting_label)
+        self.rec_redo.setEnabled(teleop and self._can_redo and not self._recording)
+        self.batch_edit.setEnabled(teleop and not self._awaiting_label and not self._recording)
 
     def _append_log(self, text: str) -> None:
         self.log.moveCursor(QTextCursor.MoveOperation.End)
@@ -1083,17 +1123,18 @@ class MainWindow(QMainWindow):
                               right_can=self.right_can.text().strip())
         dialog.exec()
 
-    def _record(self, kind: str) -> None:
+    def _record(self, kind: str, *, quiet: bool = False) -> bool:
         if not self._record_available():
-            return
+            return False
         try:
             if kind == "start":
                 name = self.batch_edit.text().strip()
                 if not name:
                     QMessageBox.warning(self, "录制", "先填写批次名称。")
-                    return
+                    return False
                 send_record(f"start,{name}")
                 self._recording = True
+                self._apply_record_state()
                 self.rec_start.setEnabled(False)
                 self.rec_stop.setEnabled(True)
                 self.batch_edit.setEnabled(False)
@@ -1130,8 +1171,13 @@ class MainWindow(QMainWindow):
                 self._apply_record_state()
                 self.record_hint.setText("这一条已丢弃。再次开始会用同一个序号。")
                 self._sync_data_dialog()
+            return True
         except OSError as error:
-            QMessageBox.critical(self, "录制", str(error))
+            if quiet:
+                self.record_hint.setText(f"采集命令发送失败：{error}")
+            else:
+                QMessageBox.critical(self, "录制", str(error))
+            return False
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._running():
