@@ -53,7 +53,10 @@ class Control {
     Dynamics *dynamics_f_;
     Dynamics *dynamics_l_;
     std::unique_ptr<SafetyFilter> safety_filter_;
+    openarm::can::socket::OpenArm* can_bus_ = nullptr;
+    std::atomic<bool> output_disabled_{false};
     mutable std::mutex telemetry_mutex_;
+    std::string output_disabled_reason_;
     std::vector<double> last_command_efforts_;
     // Exact MIT q/dq/tau that were last sent to motors (post safety / gripper hold).
     std::vector<JointState> last_mit_command_;
@@ -105,6 +108,10 @@ public:
                       const std::vector<double> &Fv, const std::vector<double> &Fo);
     void SetSafetyFilter(std::unique_ptr<SafetyFilter> safety_filter);
     void ResetSafetyFilter(const std::vector<JointState> &initial_cmd);
+    // Real CAN bus used for feedback age / error_code checks. Simulation leaves this unset.
+    void BindCanBus(openarm::can::socket::OpenArm* bus);
+    bool OutputDisabled() const;
+    std::string OutputDisabledReason() const;
     std::vector<double> GetLastCommandEfforts() const;
     // Joint-space copy of the last MIT frame actually sent (q, dq, tau).
     std::vector<JointState> GetLastMitCommand() const;
@@ -135,4 +142,13 @@ private:
     void ComputeFriction(const double *velocity, double *friction, size_t index);
     void ComputeGravity(const double *position, double *gravity);
     bool DetectVibration(const double *velocity, bool *what_axis);
+
+    // True when this step must not send another torque or Kp frame.
+    bool feedback_blocks_output();
+    void latch_output_disabled(const std::string& reason);
+    void send_zero_gain_frame(const std::vector<JointState>& joints);
+    bool latch_safety_stop(const SafetyStatus& status, const std::vector<JointState>& safe_ref);
+    bool apply_safety_filter(double dt, const std::vector<JointState>& arm_state,
+                             const std::vector<JointState>& hand_state,
+                             std::vector<JointState>* arm_ref, std::vector<JointState>* hand_ref);
 };

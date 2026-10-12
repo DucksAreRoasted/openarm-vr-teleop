@@ -53,7 +53,9 @@ inline const std::array<double, NMOTORS> INITIAL_POSITION = {0, 0, 0, 0, 0, 0, 0
 inline const std::array<double, NMOTORS> TABLE_READY_POSITION = {
     0.0, 0.0, 0.0, 1.570796, 0.0, 0.0, 0.0, 0.0};
 
-// safety limit position (Leader and Follower share the same limits)
+// Historical software position window. This is NOT the URDF mechanical limit.
+// Elbow (index 3, openarm_*_joint4) is π here; assets/v1.urdf upper is 2.443461.
+// SafetyFilter does not apply these arrays. Do not enable them as a position clamp.
 inline const std::array<double, NMOTORS> position_limit_max = {
     (2.0 / 3.0) * PI, PI, PI / 2.0, PI, J5_POSITION_LIMIT, PI / 2.0, PI / 2.0, PI};
 inline const std::array<double, NMOTORS> position_limit_min = {
@@ -66,18 +68,31 @@ inline const std::array<double, NMOTORS> position_limit_min = {
 #define position_limit_min_L position_limit_min
 #define position_limit_min_F position_limit_min
 
-// safety limit velocity (Leader and Follower share the same limits)
-// Values <= 0 disable the feedback velocity safety trigger for that motor.
+// Joint velocity limit (rad/s). A value <= 0 means that joint's velocity limit
+// is not enabled. Simulation and real hardware use this same reading: do not
+// treat 0 as "fill in a default". Left at 0 on purpose; do not invent numbers.
 inline const std::array<double, NMOTORS> velocity_limit = {0, 0, 0, 0, 0, 0, 0, 0};
 #define velocity_limit_L velocity_limit
 #define velocity_limit_F velocity_limit
 
-// safety limit effort (Leader and Follower share the same limits)
-// Values <= 0 disable the feedforward effort clamp and feedback effort safety
-// trigger for that motor. Temporarily unlocked (all joints) per request.
+// Feedforward effort limit (Nm). A value <= 0 means that joint's effort clamp
+// is not enabled. Simulation and real hardware use this same reading.
+// Left at 0 on purpose; do not invent numbers.
 inline const std::array<double, NMOTORS> effort_limit = {0, 0, 0, 0, 0, 0, 0, 0};
 #define effort_limit_L effort_limit
 #define effort_limit_F effort_limit
+
+// CAN state-feedback freshness. Same numeric standard as mirror teaching's
+// validate_feedback(), kept here so other real-arm paths can share it.
+// A motor is invalid when it has never received a state frame, the frame is
+// older than kCanFeedbackMaxAgeMs, or error_code > kCanFeedbackMaxErrorCode.
+// error_code 含义待硬件确认: 0 and 1 are accepted until the Damiao map is
+// confirmed on hardware. Values above the threshold are rejected.
+constexpr double kCanFeedbackMaxAgeMs = 150.0;
+constexpr int kCanFeedbackMaxErrorCode = 1;
+// How long startup may poll before refusing to enter a torque loop.
+// The freshness threshold stays kCanFeedbackMaxAgeMs; this is only the wait.
+constexpr int kCanFeedbackStartupWaitMs = 1000;
 
 // Motor configuration structure
 struct MotorConfig {

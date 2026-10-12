@@ -3,6 +3,10 @@
 // Quest 3 Cartesian teleoperation for OpenArm follower.
 // VR clutch pose mapping -> smoothed TCP target -> position IK -> joint reference
 // -> Control::unilateral_step() -> SafetyFilter -> MIT -> backend.
+// SafetyFilter clamps arm position to the URDF, holds the previous output on
+// NaN/inf, and limits the first position step. velocity_limit / effort_limit
+// stay 0, which means those clamps are not enabled. Follower MIT tau is 0;
+// the motor Kp spring is not limited here.
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -3064,20 +3068,33 @@ struct QuestUiBridge {
     }
 };
 
-void prime_hardware_arm(ArmTeleopBundle* arm, size_t arm_dof, size_t hand_dof) {
+bool prime_hardware_arm(ArmTeleopBundle* arm, size_t arm_dof, size_t hand_dof) {
     // Always re-seed hold to measured before stepping — default references are
     // zeros and would yank the forearm on the first MIT frame.
-    if (arm != nullptr && arm->control != nullptr) {
-        arm->control->SeedHoldMeasured();
+    if (arm == nullptr || arm->control == nullptr) {
+        return false;
+    }
+    if (!arm->control->SeedHoldMeasured()) {
+        std::cerr << "[quest-cartesian][ERROR] " << arm->label
+                  << " no fresh CAN feedback; not entering the torque loop" << std::endl;
+        keep_running = false;
+        return false;
     }
     for (int i = 0; i < 5; ++i) {
-        arm->control->unilateral_step();
+        if (!arm->control->unilateral_step()) {
+            std::cerr << "[quest-cartesian][ERROR] " << arm->label
+                      << " follower step stopped before the torque loop: "
+                      << arm->control->OutputDisabledReason() << std::endl;
+            keep_running = false;
+            return false;
+        }
     }
     const auto current = collect_joint_states(arm->state);
     arm->state->set_all_references(current);
     arm->control->ResetSafetyFilter(current);
     (void)arm_dof;
     (void)hand_dof;
+    return true;
 }
 
 void prime_sim_arm(ArmTeleopBundle* arm, size_t arm_dof, size_t hand_dof, bool table_ready) {
@@ -3728,13 +3745,21 @@ public:
           sim_hardware_(std::move(sim_hardware)) {}
 
 protected:
-    void before_start() override { std::cout << "[quest-cartesian] follower thread start"
-                                             << std::endl; }
+    void before_start() override {
+        std::cout << "[quest-cartesian] follower thread start" << std::endl;
+        PeriodicTimerThread::before_start();
+    }
 
     void after_stop() override { std::cout << "[quest-cartesian] follower thread stop" << std::endl; }
 
     void on_timer() override {
-        control_->unilateral_step();
+        if (control_ == nullptr || !control_->unilateral_step()) {
+            const std::string reason =
+                control_ != nullptr ? control_->OutputDisabledReason() : "missing control";
+            std::cerr << "[quest-cartesian] follower step stopped: " << reason << std::endl;
+            keep_running = false;
+            return;
+        }
         if (sim_hardware_ && sim_hardware_->window_should_close()) {
             keep_running = false;
         }
@@ -4270,17 +4295,33 @@ public:
 
 protected:
     void on_timer() override {
-        if (left_ != nullptr) {
-            left_->control->unilateral_step();
+        bool left_ok = true;
+        bool right_ok = true;
+        if (left_ != nullptr && left_->control != nullptr) {
+            left_ok = left_->control->unilateral_step();
             if (ui_ != nullptr) {
                 ui_->append_motor_sample(left_);
             }
         }
-        if (right_ != nullptr) {
-            right_->control->unilateral_step();
+        if (right_ != nullptr && right_->control != nullptr) {
+            right_ok = right_->control->unilateral_step();
             if (ui_ != nullptr) {
                 ui_->append_motor_sample(right_);
             }
+        }
+        if (!left_ok || !right_ok) {
+            std::cerr << "[quest-cartesian] bimanual follower step stopped"
+                      << " left="
+                      << (left_ != nullptr && left_->control != nullptr
+                              ? left_->control->OutputDisabledReason()
+                              : "")
+                      << " right="
+                      << (right_ != nullptr && right_->control != nullptr
+                              ? right_->control->OutputDisabledReason()
+                              : "")
+                      << std::endl;
+            keep_running = false;
+            return;
         }
         // Damiao status feedback (error codes / temps) → motor_status.log + motor_fault.log
         if (++fault_tick_ >= 50) {  // ~20 Hz poll; status file itself is rate-limited (~10 Hz)
@@ -5021,21 +5062,41 @@ int main(int argc, char** argv) {
                                 1.0 / FREQUENCY, ROLE_FOLLOWER, arm_side, arm_dof, hand_dof);
                 configure_follower_control(bundle->control, follower_params, arm_dof + hand_dof,
                                            options.sim, arm_side);
+                if (!options.sim && bundle->openarm != nullptr) {
+                    bundle->control->BindCanBus(bundle->openarm);
+                }
 
                 if (options.sim) {
                     prime_sim_arm(bundle, arm_dof, hand_dof, options.sim_table_ready);
                 } else if (options.auto_home) {
                     std::cout << "  [" << label << "] homing to default pose..." << std::endl;
                     // Hold measured first so AdjustPosition does not start from zero refs.
-                    bundle->control->SeedHoldMeasured();
-                    bundle->control->AdjustPosition();
-                    prime_hardware_arm(bundle, arm_dof, hand_dof);
+                    if (!bundle->control->SeedHoldMeasured()) {
+                        std::cerr << "[quest-cartesian][ERROR] " << label
+                                  << " refusing homing without fresh CAN feedback" << std::endl;
+                        return false;
+                    }
+                    if (!bundle->control->AdjustPosition()) {
+                        std::cerr << "[quest-cartesian][ERROR] " << label
+                                  << " homing stopped: " << bundle->control->OutputDisabledReason()
+                                  << std::endl;
+                        return false;
+                    }
+                    if (!prime_hardware_arm(bundle, arm_dof, hand_dof)) {
+                        return false;
+                    }
                 } else {
                     // Critical: seed measured pose before the first MIT step. Otherwise
                     // RobotSystemState references default to 0 and the elbow/forearm
                     // suddenly chases zero on enable (before any startup quintic).
-                    bundle->control->SeedHoldMeasured();
-                    prime_hardware_arm(bundle, arm_dof, hand_dof);
+                    if (!bundle->control->SeedHoldMeasured()) {
+                        std::cerr << "[quest-cartesian][ERROR] " << label
+                                  << " refusing startup without fresh CAN feedback" << std::endl;
+                        return false;
+                    }
+                    if (!prime_hardware_arm(bundle, arm_dof, hand_dof)) {
+                        return false;
+                    }
                     std::cout << "  [" << label
                               << "] hold seeded from measured motor pose (no zero-ref jerk)"
                               << std::endl;
@@ -5142,6 +5203,9 @@ int main(int argc, char** argv) {
             }
             if (!setup_arm(&right_arm, "right", "right_arm", "right", right_leaf,
                            options.follower_can_right, options.quest_port_right, false, sim_world)) {
+                if (!options.sim && left_arm.control != nullptr) {
+                    left_arm.control->Shutdown();
+                }
                 return 1;
             }
             // Always tag sides (recording / couple / hint all key off is_left).
@@ -5306,8 +5370,25 @@ int main(int argc, char** argv) {
             }
             TeleopTrajectoryLogger::shared().close();
             if (!options.sim) {
-                send_kd_only_release(left_arm.openarm, right_arm.openarm, follower_params.kp,
-                                     follower_params.kd);
+                const bool left_stopped =
+                    left_arm.control != nullptr && left_arm.control->OutputDisabled();
+                const bool right_stopped =
+                    right_arm.control != nullptr && right_arm.control->OutputDisabled();
+                if (left_stopped || right_stopped) {
+                    std::cerr << "[quest-cartesian] skip damped Kp release; output already stopped"
+                              << " left="
+                              << (left_arm.control != nullptr
+                                      ? left_arm.control->OutputDisabledReason()
+                                      : "")
+                              << " right="
+                              << (right_arm.control != nullptr
+                                      ? right_arm.control->OutputDisabledReason()
+                                      : "")
+                              << std::endl;
+                } else {
+                    send_kd_only_release(left_arm.openarm, right_arm.openarm, follower_params.kp,
+                                         follower_params.kd);
+                }
                 left_arm.control->Shutdown();
                 right_arm.control->Shutdown();
             }
@@ -5472,7 +5553,12 @@ int main(int argc, char** argv) {
         }
         TeleopTrajectoryLogger::shared().close();
         if (!options.sim) {
-            send_kd_only_release(arm.openarm, nullptr, follower_params.kp, follower_params.kd);
+            if (arm.control != nullptr && arm.control->OutputDisabled()) {
+                std::cerr << "[quest-cartesian] skip damped Kp release; output already stopped: "
+                          << arm.control->OutputDisabledReason() << std::endl;
+            } else {
+                send_kd_only_release(arm.openarm, nullptr, follower_params.kp, follower_params.kd);
+            }
             arm.control->Shutdown();
         }
         delete arm.control;

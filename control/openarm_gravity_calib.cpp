@@ -6,6 +6,7 @@
 
 #include <controller/dynamics.hpp>
 #include <controller/gravity_comp.hpp>
+#include <openarm_port/can_feedback.hpp>
 
 #include <algorithm>
 #include <array>
@@ -259,6 +260,19 @@ public:
             hardware_->recv_all(2000);
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+        const CanFeedbackVerdict verdict = refresh_until_fresh(hardware_.get());
+        if (!verdict.ok) {
+            const std::string detail = format_can_feedback_verdict(verdict, "[calib] " + side_);
+            std::cerr << detail << std::endl;
+            std::cerr << "[calib] " << side_
+                      << " 没有新鲜有效反馈，拒绝进入运动出力（不按 q=0 计算重力）" << std::endl;
+            try {
+                hardware_->disable_all();
+            } catch (...) {
+            }
+            enabled_ = false;
+            throw std::runtime_error(detail);
+        }
         dynamics_ = std::make_unique<Dynamics>(urdf, "openarm_body_link0",
                                                "openarm_" + side_ + "_link7");
         dynamics_->SetLinkMassScales(link_mass_scales_for(model, side_));
@@ -337,7 +351,19 @@ public:
 
     bool step(double t_sec, int traj_id) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fault_) {
+        if (fault_ || !enabled_) {
+            return false;
+        }
+        std::string detail;
+        if (!can_feedback_allows_torque(hardware_.get(), "[calib] " + side_, &detail)) {
+            std::cerr << detail << std::endl;
+            std::cerr << "[calib] " << side_ << " 反馈过期，停止下发并 disable_all" << std::endl;
+            try {
+                hardware_->disable_all();
+            } catch (...) {
+            }
+            enabled_ = false;
+            fault_ = true;
             return false;
         }
         std::array<double, 7> gravity{};

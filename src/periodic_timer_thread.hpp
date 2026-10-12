@@ -19,9 +19,59 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+
+struct PeriodicDeadlinePlan {
+    bool overrun = false;
+    int skipped_cycles = 0;
+    timespec next{};
+};
+
+inline void add_timespec_microseconds(timespec* time, int period_us) {
+    if (time == nullptr || period_us <= 0) {
+        return;
+    }
+    const int64_t added_ns = static_cast<int64_t>(period_us) * 1000;
+    int64_t nsec = static_cast<int64_t>(time->tv_nsec) + added_ns;
+    time->tv_sec += static_cast<time_t>(nsec / 1000000000LL);
+    time->tv_nsec = static_cast<long>(nsec % 1000000000LL);
+}
+
+inline int64_t timespec_delta_ns(const timespec& later, const timespec& earlier) {
+    return (static_cast<int64_t>(later.tv_sec) - static_cast<int64_t>(earlier.tv_sec)) * 1000000000LL +
+           (static_cast<int64_t>(later.tv_nsec) - static_cast<int64_t>(earlier.tv_nsec));
+}
+
+// `scheduled` is when the next callback was due. If `now` is already past it,
+// do not replay the missed periods. The next wake is one period after `now`,
+// and skipped_cycles is how many callbacks are not run. Callers keep the
+// previous reference by simply not invoking on_timer for those cycles.
+inline PeriodicDeadlinePlan plan_next_deadline(const timespec& scheduled, const timespec& now,
+                                               int period_us) {
+    PeriodicDeadlinePlan plan;
+    plan.next = scheduled;
+    if (period_us <= 0) {
+        plan.next = now;
+        return plan;
+    }
+    const int64_t behind_ns = timespec_delta_ns(now, scheduled);
+    if (behind_ns <= 0) {
+        return plan;
+    }
+    const int64_t period_ns = static_cast<int64_t>(period_us) * 1000;
+    int skipped = static_cast<int>(behind_ns / period_ns);
+    if (skipped < 1) {
+        skipped = 1;
+    }
+    plan.overrun = true;
+    plan.skipped_cycles = skipped;
+    plan.next = now;
+    add_timespec_microseconds(&plan.next, period_us);
+    return plan;
+}
 
 class PeriodicTimerThread {
 public:
@@ -49,28 +99,58 @@ public:
 protected:
     virtual void on_timer() = 0;
 
+    // Records a realtime request. It is applied on the periodic thread, not on
+    // the thread that called start_thread(). Subclasses that override
+    // before_start and do not call this base do not request realtime priority.
     virtual void before_start() { set_thread_priority(50); }
 
     virtual void after_stop() {}
 
+    // Records the priority. pthread_setschedparam runs once, inside the worker.
     void set_thread_priority(int priority) {
-        struct sched_param param;
-        param.sched_priority = priority;
-
-        int policy = SCHED_FIFO;
-
-        int result = pthread_setschedparam(pthread_self(), policy, &param);
-        if (result != 0) {
-            std::cerr << "[WARN] Failed to set real-time priority (errno: " << result
-                      << "). Try running with sudo or setcap." << std::endl;
-        } else {
-            std::cout << "[INFO] Real-time priority set to " << priority << std::endl;
+        if (priority > 0) {
+            realtime_priority_ = priority;
         }
+    }
+
+private:
+    void apply_realtime_priority_on_this_thread() {
+        if (realtime_priority_ <= 0 || realtime_applied_) {
+            return;
+        }
+        realtime_applied_ = true;
+        sched_param param{};
+        param.sched_priority = realtime_priority_;
+        const int result = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+        if (result != 0) {
+            static std::atomic<bool> logged{false};
+            bool expected = false;
+            if (logged.compare_exchange_strong(expected, true)) {
+                std::cerr << "[WARN] Failed to set real-time priority (errno: " << result
+                          << "). Try running with sudo or setcap." << std::endl;
+            }
+            return;
+        }
+        std::cout << "[INFO] Real-time priority set to " << realtime_priority_ << std::endl;
+    }
+
+    void warn_overrun_rate_limited(int skipped_cycles, int64_t elapsed_us, int period_us) {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_overrun_log_.time_since_epoch().count() != 0 &&
+            now - last_overrun_log_ < std::chrono::seconds(1)) {
+            return;
+        }
+        last_overrun_log_ = now;
+        std::cerr << "[WARN] periodic timer overrun: elapsed_us=" << elapsed_us
+                  << " period_us=" << period_us << " skipped_cycles=" << skipped_cycles
+                  << " holding previous cycle (no catch-up)" << std::endl;
     }
 
 private:
     void start_thread_base() {
         before_start();
+        // A restarted worker is a new pthread. Apply the recorded priority there.
+        realtime_applied_ = false;
         is_running_ = true;
         pthread_create(&thread_, nullptr, &PeriodicTimerThread::thread_entry, this);
     }
@@ -90,6 +170,7 @@ private:
     }
 
     void timer_thread() {
+        apply_realtime_priority_on_this_thread();
         struct timespec next_time;
         clock_gettime(CLOCK_MONOTONIC, &next_time);
 
@@ -103,15 +184,20 @@ private:
             }
 
             auto end = std::chrono::steady_clock::now();
-            last_elapsed_us_.store(
-                std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+            const int64_t elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+            last_elapsed_us_.store(elapsed_us);
 
-            int period_us = period_us_.load();
-            next_time.tv_nsec += period_us * 1000;
-            while (next_time.tv_nsec >= 1000000000) {
-                next_time.tv_nsec -= 1000000000;
-                next_time.tv_sec += 1;
+            const int period_us = period_us_.load();
+            timespec scheduled = next_time;
+            add_timespec_microseconds(&scheduled, period_us);
+            timespec now_ts{};
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            const PeriodicDeadlinePlan plan = plan_next_deadline(scheduled, now_ts, period_us);
+            if (plan.overrun) {
+                warn_overrun_rate_limited(plan.skipped_cycles, elapsed_us, period_us);
             }
+            next_time = plan.next;
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, nullptr);
         }
     }
@@ -120,4 +206,7 @@ private:
     std::atomic<bool> is_running_;
     std::atomic<int> period_us_;
     std::atomic<int64_t> last_elapsed_us_{0};
+    int realtime_priority_ = 0;
+    bool realtime_applied_ = false;
+    std::chrono::steady_clock::time_point last_overrun_log_{};
 };

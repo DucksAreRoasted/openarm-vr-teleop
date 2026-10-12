@@ -17,11 +17,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <controller/control.hpp>
 #include <controller/dynamics.hpp>
 #include <controller/s_curve.hpp>
 #include <iostream>
+#include <openarm_port/can_feedback.hpp>
 #include <thread>
 
 namespace {
@@ -228,7 +230,160 @@ void Control::SetParameter(const std::vector<double>& Kp, const std::vector<doub
 }
 
 void Control::SetSafetyFilter(std::unique_ptr<SafetyFilter> safety_filter) {
+    if (safety_filter) {
+        safety_filter->set_arm_side(arm_type_);
+        safety_filter->apply_shared_velocity_effort_limits();
+    }
     safety_filter_ = std::move(safety_filter);
+}
+
+void Control::BindCanBus(openarm::can::socket::OpenArm* bus) { can_bus_ = bus; }
+
+bool Control::OutputDisabled() const { return output_disabled_.load(); }
+
+std::string Control::OutputDisabledReason() const {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    return output_disabled_reason_;
+}
+
+void Control::latch_output_disabled(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> lock(telemetry_mutex_);
+        if (output_disabled_reason_.empty()) {
+            output_disabled_reason_ = reason;
+        }
+    }
+    output_disabled_.store(true);
+}
+
+bool Control::feedback_blocks_output() {
+    if (output_disabled_.load()) {
+        return true;
+    }
+    if (can_bus_ == nullptr) {
+        return false;
+    }
+    std::string detail;
+    if (can_feedback_allows_torque(can_bus_, "teleop", &detail)) {
+        return false;
+    }
+    std::cerr << detail << std::endl;
+    std::cerr << "[teleop] CAN feedback not fresh; stop sending and disable_all "
+                 "(error_code 含义待硬件确认)"
+              << std::endl;
+    try {
+        hardware_->disable_all();
+    } catch (const std::exception& error) {
+        std::cerr << "[teleop] disable_all failed: " << error.what() << std::endl;
+    }
+    if (safety_filter_) {
+        safety_filter_->set_mode(SafetyMode::Stop);
+    }
+    latch_output_disabled(detail);
+    return true;
+}
+
+void Control::send_zero_gain_frame(const std::vector<JointState>& joints) {
+    if (hardware_ == nullptr) {
+        return;
+    }
+    std::vector<openarm::damiao_motor::MITParam> arm_cmds;
+    arm_cmds.reserve(arm_motor_num_);
+    for (size_t index = 0; index < arm_motor_num_; ++index) {
+        double position = 0.0;
+        if (index < joints.size() && std::isfinite(joints[index].position)) {
+            position = joints[index].position;
+        }
+        arm_cmds.push_back({0.0, 0.0, position, 0.0, 0.0});
+    }
+    std::vector<openarm::damiao_motor::MITParam> hand_cmds;
+    hand_cmds.reserve(hand_motor_num_);
+    for (size_t index = 0; index < hand_motor_num_; ++index) {
+        const size_t joint = arm_motor_num_ + index;
+        double position = 0.0;
+        if (joint < joints.size() && std::isfinite(joints[joint].position)) {
+            position = joints[joint].position;
+        }
+        hand_cmds.push_back({0.0, 0.0, position, 0.0, 0.0});
+    }
+    hardware_->send_arm(arm_cmds);
+    hardware_->send_gripper(hand_cmds);
+}
+
+bool Control::latch_safety_stop(const SafetyStatus& status, const std::vector<JointState>& safe_ref) {
+    const std::string reason = status.reason.empty() ? "safety stop" : status.reason;
+    std::cerr << "[SafetyFilter] latched stop: " << reason << std::endl;
+    if (safety_filter_) {
+        safety_filter_->set_mode(SafetyMode::Stop);
+    }
+    const size_t expect = robot_state_ ? robot_state_->get_total_joint_count() : 0;
+    if (robot_state_ != nullptr && safe_ref.size() == expect && expect > 0) {
+        try {
+            robot_state_->set_all_references(safe_ref);
+        } catch (const std::exception& error) {
+            std::cerr << "[SafetyFilter] set_all_references failed: " << error.what() << std::endl;
+        }
+    } else {
+        std::cerr << "[SafetyFilter] not calling set_all_references (safe=" << safe_ref.size()
+                  << " state=" << expect << ")" << std::endl;
+    }
+    // One explicit zero-gain frame, then the existing disable path. No Kp spring.
+    send_zero_gain_frame(safe_ref);
+    try {
+        if (hardware_ != nullptr) {
+            hardware_->disable_all();
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[SafetyFilter] disable_all failed: " << error.what() << std::endl;
+    }
+    latch_output_disabled(reason);
+    return false;
+}
+
+bool Control::apply_safety_filter(double dt, const std::vector<JointState>& arm_state,
+                                  const std::vector<JointState>& hand_state,
+                                  std::vector<JointState>* arm_ref,
+                                  std::vector<JointState>* hand_ref) {
+    if (safety_filter_ == nullptr || arm_ref == nullptr || hand_ref == nullptr) {
+        return true;
+    }
+    std::vector<JointState> combined_ref;
+    combined_ref.reserve(arm_ref->size() + hand_ref->size());
+    combined_ref.insert(combined_ref.end(), arm_ref->begin(), arm_ref->end());
+    combined_ref.insert(combined_ref.end(), hand_ref->begin(), hand_ref->end());
+
+    std::vector<JointState> combined_state;
+    combined_state.reserve(arm_state.size() + hand_state.size());
+    combined_state.insert(combined_state.end(), arm_state.begin(), arm_state.end());
+    combined_state.insert(combined_state.end(), hand_state.begin(), hand_state.end());
+
+    std::vector<JointState> safe_ref;
+    const SafetyStatus status = safety_filter_->filter(combined_ref, combined_state, dt, &safe_ref);
+    if (status.emergency_stop) {
+        return latch_safety_stop(status, safe_ref);
+    }
+    if (safe_ref.size() != arm_ref->size() + hand_ref->size()) {
+        SafetyStatus mismatch;
+        mismatch.ok = false;
+        mismatch.emergency_stop = true;
+        mismatch.reason = "filtered reference size mismatch";
+        return latch_safety_stop(mismatch, safe_ref);
+    }
+    const size_t arm_count = arm_ref->size();
+    arm_ref->assign(safe_ref.begin(), safe_ref.begin() + static_cast<std::ptrdiff_t>(arm_count));
+    hand_ref->assign(safe_ref.begin() + static_cast<std::ptrdiff_t>(arm_count), safe_ref.end());
+    if (robot_state_ != nullptr) {
+        try {
+            robot_state_->set_all_references(safe_ref);
+        } catch (const std::exception& error) {
+            SafetyStatus mismatch;
+            mismatch.ok = false;
+            mismatch.emergency_stop = true;
+            mismatch.reason = std::string("set_all_references failed: ") + error.what();
+            return latch_safety_stop(mismatch, safe_ref);
+        }
+    }
+    return true;
 }
 
 void Control::ResetSafetyFilter(const std::vector<JointState>& initial_cmd) {
@@ -256,6 +411,9 @@ bool Control::GripperSlipBoostActive() const {
 }
 
 bool Control::bilateral_step() {
+    if (feedback_blocks_output()) {
+        return false;
+    }
     // get motor status
     std::vector<MotorState> arm_motor_states = hardware_->read_arm();
     std::vector<MotorState> gripper_motor_states = hardware_->read_gripper();
@@ -299,36 +457,9 @@ bool Control::bilateral_step() {
     std::vector<JointState> joint_gripper_states_ref =
         robot_state_->hand_state().get_all_references();
 
-    if (safety_filter_) {
-        std::vector<JointState> combined_ref;
-        combined_ref.reserve(joint_arm_states_ref.size() + joint_gripper_states_ref.size());
-        combined_ref.insert(combined_ref.end(), joint_arm_states_ref.begin(),
-                            joint_arm_states_ref.end());
-        combined_ref.insert(combined_ref.end(), joint_gripper_states_ref.begin(),
-                            joint_gripper_states_ref.end());
-
-        std::vector<JointState> combined_state;
-        combined_state.reserve(joint_arm_states.size() + joint_gripper_states.size());
-        combined_state.insert(combined_state.end(), joint_arm_states.begin(),
-                              joint_arm_states.end());
-        combined_state.insert(combined_state.end(), joint_gripper_states.begin(),
-                              joint_gripper_states.end());
-
-        std::vector<JointState> safe_ref;
-        const SafetyStatus status =
-            safety_filter_->filter(combined_ref, combined_state, Ts_, &safe_ref);
-        if (status.emergency_stop && !status.reason.empty()) {
-            std::cerr << "[SafetyFilter] " << status.reason << std::endl;
-        }
-        if (status.emergency_stop) {
-            robot_state_->set_all_references(safe_ref);
-            return true;
-        }
-        joint_arm_states_ref.assign(safe_ref.begin(),
-                                    safe_ref.begin() + joint_arm_states_ref.size());
-        joint_gripper_states_ref.assign(safe_ref.begin() + joint_arm_states_ref.size(),
-                                        safe_ref.end());
-        robot_state_->set_all_references(safe_ref);
+    if (!apply_safety_filter(Ts_, joint_arm_states, joint_gripper_states, &joint_arm_states_ref,
+                             &joint_gripper_states_ref)) {
+        return false;
     }
 
     std::vector<double> joint_arm_positions_ref(arm_dof);
@@ -364,36 +495,9 @@ bool Control::bilateral_step() {
         joint_gripper_states_ref[i].effort = friction[i + arm_dof];
     }
 
-    if (safety_filter_) {
-        std::vector<JointState> combined_ref;
-        combined_ref.reserve(joint_arm_states_ref.size() + joint_gripper_states_ref.size());
-        combined_ref.insert(combined_ref.end(), joint_arm_states_ref.begin(),
-                            joint_arm_states_ref.end());
-        combined_ref.insert(combined_ref.end(), joint_gripper_states_ref.begin(),
-                            joint_gripper_states_ref.end());
-
-        std::vector<JointState> combined_state;
-        combined_state.reserve(joint_arm_states.size() + joint_gripper_states.size());
-        combined_state.insert(combined_state.end(), joint_arm_states.begin(),
-                              joint_arm_states.end());
-        combined_state.insert(combined_state.end(), joint_gripper_states.begin(),
-                              joint_gripper_states.end());
-
-        std::vector<JointState> safe_ref;
-        const SafetyStatus status =
-            safety_filter_->filter(combined_ref, combined_state, Ts_, &safe_ref);
-        if (status.emergency_stop && !status.reason.empty()) {
-            std::cerr << "[SafetyFilter] " << status.reason << std::endl;
-        }
-        if (status.emergency_stop) {
-            robot_state_->set_all_references(safe_ref);
-            return true;
-        }
-        joint_arm_states_ref.assign(safe_ref.begin(),
-                                    safe_ref.begin() + joint_arm_states_ref.size());
-        joint_gripper_states_ref.assign(safe_ref.begin() + joint_arm_states_ref.size(),
-                                        safe_ref.end());
-        robot_state_->set_all_references(safe_ref);
+    if (!apply_safety_filter(Ts_, joint_arm_states, joint_gripper_states, &joint_arm_states_ref,
+                             &joint_gripper_states_ref)) {
+        return false;
     }
 
     std::vector<MotorState> motor_arm_states =
@@ -444,6 +548,9 @@ bool Control::bilateral_step() {
 }
 
 bool Control::unilateral_step() {
+    if (feedback_blocks_output()) {
+        return false;
+    }
     // get motor status
     std::vector<MotorState> arm_motor_states = hardware_->read_arm();
     std::vector<MotorState> gripper_motor_states = hardware_->read_gripper();
@@ -554,35 +661,9 @@ bool Control::unilateral_step() {
         std::vector<JointState> joint_hand_states_ref =
             robot_state_->hand_state().get_all_references();
 
-        std::vector<JointState> combined_state;
-        combined_state.reserve(joint_arm_states.size() + joint_gripper_states.size());
-        combined_state.insert(combined_state.end(), joint_arm_states.begin(),
-                              joint_arm_states.end());
-        combined_state.insert(combined_state.end(), joint_gripper_states.begin(),
-                              joint_gripper_states.end());
-
-        std::vector<JointState> combined_ref;
-        combined_ref.reserve(joint_arm_states_ref.size() + joint_hand_states_ref.size());
-        combined_ref.insert(combined_ref.end(), joint_arm_states_ref.begin(),
-                            joint_arm_states_ref.end());
-        combined_ref.insert(combined_ref.end(), joint_hand_states_ref.begin(),
-                            joint_hand_states_ref.end());
-        if (safety_filter_) {
-            std::vector<JointState> safe_ref;
-            const SafetyStatus status =
-                safety_filter_->filter(combined_ref, combined_state, Ts_, &safe_ref);
-            if (status.emergency_stop && !status.reason.empty()) {
-                std::cerr << "[SafetyFilter] " << status.reason << std::endl;
-            }
-            if (status.emergency_stop) {
-                robot_state_->set_all_references(safe_ref);
-                return true;
-            }
-            joint_arm_states_ref.assign(safe_ref.begin(),
-                                        safe_ref.begin() + joint_arm_states_ref.size());
-            joint_hand_states_ref.assign(safe_ref.begin() + joint_arm_states_ref.size(),
-                                         safe_ref.end());
-            robot_state_->set_all_references(safe_ref);
+        if (!apply_safety_filter(Ts_, joint_arm_states, joint_gripper_states, &joint_arm_states_ref,
+                                 &joint_hand_states_ref)) {
+            return false;
         }
 
         double gripper_kp_scale = 1.0;
@@ -789,11 +870,32 @@ bool Control::AdjustPosition(void) {
 }
 
 bool Control::SeedHoldMeasured() {
-    if (hardware_ == nullptr || robot_state_ == nullptr) {
+    if (hardware_ == nullptr || robot_state_ == nullptr || output_disabled_.load()) {
         return false;
     }
-    // Refresh feedback, then immediately command the measured pose (zero velocity).
-    hardware_->recv_all(200);
+    if (can_bus_ != nullptr) {
+        const CanFeedbackVerdict verdict = refresh_until_fresh(can_bus_);
+        if (!verdict.ok) {
+            const std::string detail = format_can_feedback_verdict(verdict, "teleop SeedHoldMeasured");
+            std::cerr << detail << std::endl;
+            std::cerr << "[teleop] no fresh CAN feedback; refusing Kp hold and torque loop "
+                         "(error_code 含义待硬件确认)"
+                      << std::endl;
+            try {
+                hardware_->disable_all();
+            } catch (const std::exception& error) {
+                std::cerr << "[teleop] disable_all failed: " << error.what() << std::endl;
+            }
+            if (safety_filter_) {
+                safety_filter_->set_mode(SafetyMode::Stop);
+            }
+            latch_output_disabled(detail);
+            return false;
+        }
+    } else {
+        // Simulation has no CAN timestamps. Keep the existing refresh.
+        hardware_->recv_all(200);
+    }
     std::vector<MotorState> arm_motor_states = hardware_->read_arm();
     std::vector<MotorState> gripper_motor_states = hardware_->read_gripper();
 
@@ -918,6 +1020,9 @@ bool Control::AdjustPositionTo(const std::vector<JointState>& goal) {
               << "s, max_delta=" << max_delta << " rad" << std::endl;
 
     for (int step = 0; step < nstep; ++step) {
+        if (feedback_blocks_output()) {
+            return false;
+        }
         const double t = duration * static_cast<double>(step + 1) / nstep;
         std::vector<double> q(q0.size(), 0.0);
         std::vector<double> dq(q0.size(), 0.0);
@@ -945,31 +1050,9 @@ bool Control::AdjustPositionTo(const std::vector<JointState>& goal) {
             }
         }
 
-        if (safety_filter_) {
-            std::vector<JointState> combined_interp;
-            combined_interp.reserve(joint_arm_interp.size() + joint_hand_interp.size());
-            combined_interp.insert(combined_interp.end(), joint_arm_interp.begin(),
-                                   joint_arm_interp.end());
-            combined_interp.insert(combined_interp.end(), joint_hand_interp.begin(),
-                                   joint_hand_interp.end());
-
-            std::vector<JointState> combined_now;
-            combined_now.reserve(joint_arm_now.size() + joint_hand_now.size());
-            combined_now.insert(combined_now.end(), joint_arm_now.begin(), joint_arm_now.end());
-            combined_now.insert(combined_now.end(), joint_hand_now.begin(), joint_hand_now.end());
-
-            std::vector<JointState> safe_interp;
-            const SafetyStatus status =
-                safety_filter_->filter(combined_interp, combined_now, 0.01, &safe_interp);
-            if (status.emergency_stop && !status.reason.empty()) {
-                std::cerr << "[SafetyFilter][AdjustPosition] " << status.reason << std::endl;
-            }
-            if (!status.emergency_stop) {
-                joint_arm_interp.assign(safe_interp.begin(),
-                                        safe_interp.begin() + joint_arm_interp.size());
-                joint_hand_interp.assign(safe_interp.begin() + joint_arm_interp.size(),
-                                         safe_interp.end());
-            }
+        if (!apply_safety_filter(0.01, joint_arm_now, joint_hand_now, &joint_arm_interp,
+                                 &joint_hand_interp)) {
+            return false;
         }
 
         std::vector<MotorState> arm_motor_refs =
