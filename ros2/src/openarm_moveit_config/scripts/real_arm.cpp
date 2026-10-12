@@ -5,6 +5,7 @@
 #include <controller/dynamics.hpp>
 #include <controller/gravity_comp.hpp>
 #include <controller/s_curve.hpp>
+#include <openarm_port/can_feedback.hpp>
 
 #include <algorithm>
 #include <array>
@@ -298,6 +299,16 @@ public:
         } else {
             apply_gravity_model(dynamics_.get(), model_, side_);
         }
+        const CanFeedbackVerdict verdict = refresh_until_fresh(hardware_.get());
+        if (!verdict.ok) {
+            const std::string detail = format_can_feedback_verdict(verdict, "[real_arm] " + side_);
+            try {
+                hardware_->disable_all();
+            } catch (...) {
+            }
+            enabled_ = false;
+            throw std::runtime_error(detail + "；没有新鲜有效反馈，拒绝进入出力循环（不按 q=0 计算重力）");
+        }
         read();
         std::lock_guard<std::mutex> lock(mutex_);
         command_ = measured_;
@@ -343,11 +354,31 @@ public:
         integral_tau_.fill(0.0);
     }
 
-    void spin_once(double t_sec) {
+    bool faulted() const { return fault_; }
+    const std::string& fault_reason() const { return fault_reason_; }
+
+    bool spin_once(double t_sec) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!enabled_ || fault_) {
+            return false;
+        }
+        std::string detail;
+        if (!can_feedback_allows_torque(hardware_.get(), "[real_arm] " + side_, &detail)) {
+            RCLCPP_ERROR(rclcpp::get_logger("real_arm"),
+                         "%s；反馈过期，停止下发并 disable_all", detail.c_str());
+            try {
+                hardware_->disable_all();
+            } catch (...) {
+            }
+            enabled_ = false;
+            fault_ = true;
+            fault_reason_ = detail;
+            return false;
+        }
         send_locked(t_sec);
         hardware_->recv_all(1000);
         read_locked();
+        return true;
     }
 
     void fill(sensor_msgs::msg::JointState* message) {
@@ -571,6 +602,8 @@ private:
     double gripper_ = 0.0;
     double gripper_hold_ = 0.0;
     bool enabled_ = false;
+    bool fault_ = false;
+    std::string fault_reason_;
     int log_div_ = 0;
     Trajectory trajectory_;
     std::chrono::steady_clock::time_point last_track_wall_{};
@@ -881,10 +914,18 @@ private:
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
             sensor_msgs::msg::JointState message;
             message.header.stamp = stamp;
+            bool feedback_failed = false;
             for (auto& [_, arm] : arms_) {
                 arm->track(stamp);
-                arm->spin_once(t_sec);
+                if (!arm->spin_once(t_sec)) {
+                    feedback_failed = true;
+                    RCLCPP_ERROR(get_logger(), "真机反馈无效，已失能：%s", arm->fault_reason().c_str());
+                }
                 arm->fill(&message);
+            }
+            if (feedback_failed) {
+                running_ = false;
+                break;
             }
             publisher_->publish(message);
             next += std::chrono::milliseconds(10);
