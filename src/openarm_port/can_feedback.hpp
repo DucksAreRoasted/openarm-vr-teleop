@@ -139,7 +139,7 @@ void append_motor_feedback_samples(const Motors& motors, std::vector<CanFeedback
 
 // Arm motors first, then the gripper motor. Same 8-motor set mirror teaching checks.
 template <class Arm>
-CanFeedbackVerdict evaluate_openarm_feedback(const Arm& arm,
+CanFeedbackVerdict evaluate_openarm_feedback(Arm& arm,
                                             std::chrono::steady_clock::time_point now,
                                             const CanFeedbackLimits& limits = {}) {
     std::vector<CanFeedbackSample> samples;

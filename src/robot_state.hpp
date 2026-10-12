@@ -15,6 +15,7 @@
 #pragma once
 
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 // Represents the state of a single joint: position, velocity, and effort.
