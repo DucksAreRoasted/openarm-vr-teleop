@@ -1,8 +1,6 @@
-// SafetyFilter contract. Does not open CAN or a simulator.
-// nonfinite: NaN/Inf must not pass through; position stays on the last finite command.
-// clamp: out-of-range references must clamp to the URDF elbow limit. Not implemented
-//        on main, so this mode returns 77 until the control/safety change lands.
-// default-elbow: prints make_default_safety_config()'s elbow upper limit.
+// SafetyFilter non-finite behavior that already holds on main.
+// URDF clamping, Stop, and size mismatch are tested in safety_filter_api_test.cpp
+// and run only after PR #4's helpers are present.
 
 #include "safety_contract.hpp"
 
@@ -16,8 +14,6 @@
 #include <vector>
 
 namespace {
-
-constexpr int kNotOnMain = 77;
 
 SafetyConfig wide_config() {
     SafetyConfig config;
@@ -93,50 +89,6 @@ int test_nonfinite() {
     return 0;
 }
 
-int test_clamp() {
-    SafetyConfig config = wide_config();
-    config.min_position[static_cast<size_t>(kElbowJointIndex)] = 0.0;
-    config.max_position[static_cast<size_t>(kElbowJointIndex)] = kElbowUrdfUpperRad;
-    const auto seed = pose_with_elbow(1.0, 0.0, 0.0);
-
-    auto run = [&](double command) {
-        SafetyFilter filter(config);
-        filter.reset(seed);
-        auto raw = pose_with_elbow(command, 0.0, 0.0);
-        std::vector<JointState> out;
-        filter.filter(raw, seed, 0.001, &out);
-        return out[static_cast<size_t>(kElbowJointIndex)].position;
-    };
-
-    // 4 rad is past both the URDF elbow stop and the pi constant.
-    // URDF + 0.3 rad is past the URDF stop and still below pi, so a clamp to
-    // position_limit_max would leave it unchanged.
-    const double above_both = 4.0;
-    const double between_urdf_and_pi = kElbowUrdfUpperRad + 0.3;
-    const double high = run(above_both);
-    const double mid = run(between_urdf_and_pi);
-    const bool unchanged = std::abs(high - above_both) < 1e-9 &&
-                           std::abs(mid - between_urdf_and_pi) < 1e-9;
-    if (unchanged) {
-        std::cerr << "SafetyFilter does not clamp position on main\n";
-        return kNotOnMain;
-    }
-    const bool at_urdf = std::abs(high - kElbowUrdfUpperRad) < 1e-6 &&
-                         std::abs(mid - kElbowUrdfUpperRad) < 1e-6;
-    if (!at_urdf) {
-        return fail("elbow command was clamped, but not to the URDF upper limit");
-    }
-    return 0;
-}
-
-int print_default_elbow() {
-    const SafetyConfig config = make_default_safety_config(8);
-    std::cout.setf(std::ios::fmtflags(0), std::ios::floatfield);
-    std::cout.precision(17);
-    std::cout << config.max_position.at(static_cast<size_t>(kElbowJointIndex)) << "\n";
-    return 0;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -144,12 +96,6 @@ int main(int argc, char** argv) {
     if (mode == "nonfinite") {
         return test_nonfinite();
     }
-    if (mode == "clamp") {
-        return test_clamp();
-    }
-    if (mode == "default-elbow") {
-        return print_default_elbow();
-    }
-    std::cerr << "usage: safety_filter_contract_test nonfinite|clamp|default-elbow\n";
+    std::cerr << "usage: safety_filter_contract_test nonfinite\n";
     return 2;
 }
