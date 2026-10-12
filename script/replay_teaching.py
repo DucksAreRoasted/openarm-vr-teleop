@@ -77,6 +77,7 @@ def main() -> int:
     mode.add_argument("--sim", action="store_true")
     mode.add_argument("--real", action="store_true")
     parser.add_argument("--speed", type=float, default=.5)
+    parser.add_argument("--repeat", type=int, default=1, help="播放次数；0 表示持续循环，直到停止")
     parser.add_argument("--left-can", default="can1")
     parser.add_argument("--right-can", default="can0")
     parser.add_argument("--source-meters", action="store_true")
@@ -84,6 +85,8 @@ def main() -> int:
     args = parser.parse_args()
     if not .1 <= args.speed <= 1:
         parser.error("speed 必须在 0.1～1.0 之间")
+    if args.repeat < 0:
+        parser.error("repeat 必须为非负整数")
     # A private session lets the GUI stop compilation and the servo as one group.
     if os.getpgrp() != os.getpid():
         os.setsid()
@@ -97,6 +100,7 @@ def main() -> int:
                    "openarm_teaching_replay", "-j2"])
             command = [str(ROOT / "build/openarm_teaching_replay"), "--csv", str(source),
                        "--real" if args.real else "--sim", "--speed", str(args.speed),
+                       "--repeat", str(args.repeat),
                        "--urdf", os.environ.get("OPENARM_TELEOP_URDF", str(ROOT / "assets/v1.urdf")),
                        "--xml", os.environ.get("OPENARM_MUJOCO_XML", "/home/ducks/motion-trajectory-studio/model_library/OpenArm_V1/scene_table.xml"),
                        "--gravity-yaml", os.environ.get("OPENARM_GRAVITY_YAML", str(ROOT / "config/gravity_comp.yaml")),

@@ -13,8 +13,8 @@ import tempfile
 from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout,
+    QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
 )
 
 from .services import ROOT
@@ -59,13 +59,19 @@ class ReplayDialog(QDialog):
         self._error_text = ""
         self._playing = False
         self._complete = False
+        self._cycle = 1
         self._run_id = 0
         self._log_path: Path | None = None
         layout = QVBoxLayout(self)
-        description = QLabel("先用 Quest 遥操、KER 或同向示教录制动作，停录并标注后，停止并释放控制器，再选择片段回放。\n"
-                             "回放驱动左右臂及夹爪；先慢速接入首帧，结束后保持末帧，点击停止才释放。")
+        title = QLabel("动作回放")
+        title.setObjectName("HeroTitle")
+        layout.addWidget(title)
+        description = QLabel("选择已保存的动作，设置速度与循环次数。回放前请停止遥操控制器。")
+        description.setObjectName("Hint")
         description.setWordWrap(True)
         layout.addWidget(description)
+        source_box = QGroupBox("1 · 选择动作")
+        source_layout = QVBoxLayout(source_box)
         paths = QHBoxLayout()
         self.source = TrajectoryPath(source)
         paths.addWidget(self.source, 1)
@@ -74,8 +80,10 @@ class ReplayDialog(QDialog):
         self.folder.clicked.connect(self._choose_folder)
         self.file.clicked.connect(self._choose_file)
         paths.addWidget(self.folder); paths.addWidget(self.file)
-        layout.addLayout(paths)
-        options = QHBoxLayout()
+        source_layout.addLayout(paths)
+        layout.addWidget(source_box)
+        settings_box = QGroupBox("2 · 回放设置")
+        options = QFormLayout(settings_box)
         self.mode = QComboBox(); self.mode.addItems(["仿真回放", "真机回放"])
         self.speed = QComboBox()
         for label, value in (("0.25 倍", .25), ("0.5 倍", .5), ("1 倍", 1.0)):
@@ -84,8 +92,27 @@ class ReplayDialog(QDialog):
         self.units = QComboBox(); self.units.addItems(["源数据：真机夹爪角度", "源数据：仿真夹爪位移"])
         self.source.textChanged.connect(self._source_changed)
         self._source_changed(source)
-        options.addWidget(self.mode); options.addWidget(self.speed); options.addWidget(self.units)
-        layout.addLayout(options)
+        options.addRow("运行环境", self.mode)
+        options.addRow("播放速度", self.speed)
+        options.addRow("录制来源", self.units)
+        repeats = QHBoxLayout()
+        self.repeat = QSpinBox()
+        self.repeat.setRange(0, 10000)
+        self.repeat.setValue(1)
+        self.repeat.setSpecialValueText("持续循环")
+        self.repeat.setSuffix(" 遍")
+        self.repeat.setToolTip("每遍结束后保持使能，慢速返回首帧，再播放下一遍；返回路径也须检查障碍物。")
+        repeats.addWidget(self.repeat)
+        self.forever = QCheckBox("持续循环")
+        self.forever.toggled.connect(self._forever_changed)
+        self.repeat.valueChanged.connect(self._repeat_changed)
+        repeats.addWidget(self.forever)
+        options.addRow("播放次数", repeats)
+        playback_hint = QLabel("每遍之间慢速返回首帧；全部播完保持末帧，停止后释放双臂。请先在仿真检查返回路径。")
+        playback_hint.setWordWrap(True)
+        playback_hint.setObjectName("Hint")
+        options.addRow(playback_hint)
+        layout.addWidget(settings_box)
         self.safety = QCheckBox(f"真机确认：CAN 已配置（左 {left_can}、右 {right_can}），工作区清空，急停可用")
         layout.addWidget(self.safety)
         self.mode.currentIndexChanged.connect(self._update_controls)
@@ -105,7 +132,12 @@ class ReplayDialog(QDialog):
         layout.addWidget(self.progress)
         self.status = QLabel("请选择轨迹；默认仿真、0.5 倍速度。真机前请先验证仿真。")
         self.status.setWordWrap(True); layout.addWidget(self.status)
+        self.log_toggle = QCheckBox("显示运行日志")
+        layout.addWidget(self.log_toggle)
         self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumBlockCount(1000)
+        self.log.setMinimumHeight(100)
+        self.log.setVisible(False)
+        self.log_toggle.toggled.connect(self.log.setVisible)
         layout.addWidget(self.log, 1)
         self.start.setToolTip("检查整段文件和关节限位，通过后慢速接入首帧，再播放。不会回放录制时的力矩。")
         self.pause.setToolTip("暂停轨迹时间，双臂继续保持当前位置附近；继续后从暂停位置播放。")
@@ -121,9 +153,17 @@ class ReplayDialog(QDialog):
     def _running(self) -> bool:
         return self.process.state() != QProcess.ProcessState.NotRunning
 
+    def _forever_changed(self, checked: bool) -> None:
+        self.repeat.setValue(0 if checked else max(1, self.repeat.value()))
+
+    def _repeat_changed(self, value: int) -> None:
+        self.forever.blockSignals(True)
+        self.forever.setChecked(value == 0)
+        self.forever.blockSignals(False)
+
     def _update_controls(self, *_args) -> None:
         running = self._running()
-        for widget in (self.source, self.folder, self.file, self.mode, self.speed, self.units, self.safety):
+        for widget in (self.source, self.folder, self.file, self.mode, self.speed, self.units, self.safety, self.repeat, self.forever):
             widget.setEnabled(not running)
         self.start.setEnabled(not running and (self.mode.currentIndex() == 0 or self.safety.isChecked()))
         self.pause.setEnabled(running and self._playing and not self._complete and not self._stopping)
@@ -161,10 +201,12 @@ class ReplayDialog(QDialog):
         self._run_id += 1
         self._buffer = ""; self._error_text = ""; self._paused = False
         self._stopping = False; self._complete = False; self._playing = False
+        self._cycle = 1
         self.pause.setText("暂停")
         command = [str(ROOT / "script/replay_teaching.py"), str(source.resolve()), "--real" if real else "--sim",
                    "--speed", str(self.speed.currentData()), "--left-can", self.left_can, "--right-can", self.right_can]
         if self.units.currentIndex() == 1: command.append("--source-meters")
+        command.extend(["--repeat", str(self.repeat.value())])
         self._log_path = Path(tempfile.gettempdir()) / (
             f"openarm_teaching_replay_{datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log")
         try:
@@ -197,14 +239,18 @@ class ReplayDialog(QDialog):
             line, self._buffer = self._buffer.split("\n", 1)
             self._append_log(line)
             if "[replay][ERROR]" in line: self._error_text = line
-            if "[replay] ALIGNING" in line: self.status.setText("正在慢速接入首帧…")
+            if "[replay] ALIGNING" in line:
+                self._playing = True
+                cycle = re.search(r"cycle=(\d+)", line)
+                if cycle: self._cycle = int(cycle[1])
+                self.status.setText("正在慢速接入首帧…")
             if "[replay] PLAYING" in line: self._playing = True
             match = re.search(r"PROGRESS time=([\d.e+-]+) duration=([\d.e+-]+) phase=(\w+)", line)
             if match and not self._stopping:
                 instant, duration = float(match[1]), float(match[2])
                 phase = {"aligning": "接入首帧", "playing": "回放中", "paused": "已暂停", "complete": "已完成，保持末帧"}[match[3]]
                 self.progress.setValue(int(1000*instant/duration) if duration > 0 else 0)
-                self.status.setText(f"{phase}  {instant:.1f} / {duration:.1f} 秒")
+                self.status.setText(f"第 {self._cycle} 遍 · {phase}  {instant:.1f} / {duration:.1f} 秒")
             if "[replay] COMPLETE" in line: self._complete = True
         self._update_controls()
 
