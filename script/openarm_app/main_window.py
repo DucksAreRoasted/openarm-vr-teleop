@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QSizePolicy,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -169,7 +170,10 @@ class MainWindow(QMainWindow):
         head.addWidget(self.status)
         root.addLayout(head)
 
-        columns = QHBoxLayout()
+        workspace = QWidget()
+        workspace.setObjectName("Workspace")
+        columns = QHBoxLayout(workspace)
+        columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(12)
         left = QVBoxLayout()
         left.setSpacing(8)
@@ -177,7 +181,10 @@ class MainWindow(QMainWindow):
         right.setSpacing(8)
         columns.addLayout(left, stretch=5)
         columns.addLayout(right, stretch=4)
-        root.addLayout(columns, stretch=1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(workspace)
+        root.addWidget(scroll, stretch=1)
 
         # Mode
         mode_box = QGroupBox("模式")
@@ -248,8 +255,9 @@ class MainWindow(QMainWindow):
         can_row.addStretch(1)
         link_outer.addLayout(can_row)
         self.safety = QCheckBox(
-            "确认 CAN 独占、工作区已清空，物理急停随时可及（MoveIt/零重力连真机必勾）"
+            "确认 CAN 独占、工作区清空、急停可用"
         )
+        self.safety.setToolTip("真机操作前确认；MoveIt 和零重力连接真机也必须勾选。")
         self.safety.toggled.connect(lambda _: self._apply_mode())
         link_outer.addWidget(self.safety)
         self.quest_label = QLabel(f"Quest：https://{local_ip()}:{HTTP_PORT}")
@@ -301,7 +309,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.btn_stop)
         action_row.addWidget(self.btn_motor)
         action_row.addStretch(1)
-        left.addWidget(actions)
+        root.addWidget(actions)
         left.addStretch(1)
 
         # Gravity
@@ -334,9 +342,7 @@ class MainWindow(QMainWindow):
         g_btns.addStretch(1)
         g_layout.addLayout(g_btns)
         g_actions = QLabel(
-            "自动微调：机械臂运动采数，验证改善后保存，执行前自动备份。\n"
-            "手动微调：逐关节调参，可恢复模板、热加载试调或保存参数。\n"
-            "悬停按钮可查看操作说明。"
+            "自动微调会驱动机械臂运动；手动微调支持参数热加载。"
         )
         g_actions.setObjectName("Hint")
         g_actions.setWordWrap(True)
@@ -346,33 +352,40 @@ class MainWindow(QMainWindow):
         # Recording
         record = QGroupBox("数据采集")
         r_layout = QVBoxLayout(record)
+        record_header = QHBoxLayout()
+        record_header.addWidget(QLabel("录制 → 停止 → 标注"))
+        record_header.addStretch()
+        self.record_badge = QLabel("未就绪")
+        self.record_badge.setObjectName("RecordBadge")
+        record_header.addWidget(self.record_badge)
+        r_layout.addLayout(record_header)
         batch_row = QHBoxLayout()
         batch_row.addWidget(QLabel("批次"))
         self.batch_edit = QLineEdit()
+        self.batch_edit.setPlaceholderText("为这批动作命名")
         batch_row.addWidget(self.batch_edit, stretch=1)
         r_layout.addLayout(batch_row)
         row1 = QHBoxLayout()
         self.rec_start = QPushButton("开始录制")
         self.rec_start.setObjectName("Primary")
-        self.rec_stop = QPushButton("停止")
+        self.rec_stop = QPushButton("结束本条")
         self.rec_start.clicked.connect(lambda: self._record("start"))
         self.rec_stop.clicked.connect(lambda: self._record("stop"))
         row1.addWidget(self.rec_start)
         row1.addWidget(self.rec_stop)
-        row1.addStretch(1)
         r_layout.addLayout(row1)
         row2 = QHBoxLayout()
-        self.rec_ok = QPushButton("成功")
-        self.rec_bad = QPushButton("失败")
+        self.rec_ok = QPushButton("标记成功")
+        self.rec_ok.setObjectName("Success")
+        self.rec_bad = QPushButton("标记失败")
         self.rec_bad.setObjectName("Danger")
-        self.rec_redo = QPushButton("重新录制")
+        self.rec_redo = QPushButton("丢弃重录")
         self.rec_ok.clicked.connect(lambda: self._record("success"))
         self.rec_bad.clicked.connect(lambda: self._record("fail"))
         self.rec_redo.clicked.connect(lambda: self._record("redo"))
         row2.addWidget(self.rec_ok)
         row2.addWidget(self.rec_bad)
         row2.addWidget(self.rec_redo)
-        row2.addStretch(1)
         r_layout.addLayout(row2)
         manage_row = QHBoxLayout()
         self.btn_data_manage = QPushButton("数据管理…")
@@ -382,17 +395,33 @@ class MainWindow(QMainWindow):
         self.btn_replay.setToolTip("Quest 遥操、KER 或手拖示教录制后，停止并释放，再选择片段自动回放；支持仿真、变速、暂停和停止。")
         self.btn_replay.clicked.connect(lambda: self._open_replay())
         manage_row.addWidget(self.btn_replay)
-        manage_row.addStretch(1)
         r_layout.addLayout(manage_row)
         self.record_hint = QLabel("启动后可录；停录后再标成功 / 失败 / 重录")
         self.record_hint.setObjectName("Hint")
         self.record_hint.setWordWrap(True)
         r_layout.addWidget(self.record_hint)
-        shortcuts_hint = QLabel("Quest 摇杆按下：左短按开始/停止，左长按重录；停录后右短按成功、右长按失败。长按 1 秒后松开。")
-        shortcuts_hint.setWordWrap(True)
-        shortcuts_hint.setObjectName("Hint")
-        r_layout.addWidget(shortcuts_hint)
+        shortcuts = QFrame()
+        shortcuts.setObjectName("ShortcutCard")
+        shortcut_grid = QGridLayout(shortcuts)
+        for column, (hand, short, long) in enumerate((
+            ("左摇杆", "短按  开始 / 结束录制", "长按  丢弃重录"),
+            ("右摇杆 · 停录后", "短按  标记成功", "长按  标记失败"),
+        )):
+            heading = QLabel(hand)
+            heading.setObjectName("ShortcutTitle")
+            shortcut_grid.addWidget(heading, 0, column)
+            for row, text in enumerate((short, long), 1):
+                label = QLabel(text)
+                label.setWordWrap(True)
+                shortcut_grid.addWidget(label, row, column)
+        note = QLabel("长按 1 秒后松开 · A/B、X/Y 控制夹爪")
+        note.setObjectName("Hint")
+        note.setWordWrap(True)
+        shortcut_grid.addWidget(note, 3, 0, 1, 2)
+        r_layout.addWidget(shortcuts)
         right.addWidget(record)
+        right.removeWidget(gravity)
+        right.addWidget(gravity)
 
         self.btn_refresh_usb.setToolTip('重新扫描 USB 相机设备，更新设备列表。')
         self.btn_open_cams.setToolTip('打开相机预览窗口，检查画面和相机选择。')
@@ -413,7 +442,12 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(120)
         log_layout.addWidget(self.log)
-        right.addWidget(log_box, stretch=1)
+        log_toggle = QCheckBox("显示运行日志")
+        log_toggle.toggled.connect(log_box.setVisible)
+        right.addWidget(log_toggle)
+        log_box.setVisible(False)
+        right.addWidget(log_box)
+        right.addStretch(1)
 
     def _mode(self) -> str:
         if self.radio_ker_sim.isChecked():
@@ -512,6 +546,13 @@ class MainWindow(QMainWindow):
         elif self._mode() in ("real", "moveit", "zerog", "mirror", "ker_real"):
             self._set_can_enabled(True)
         teleop = self._record_available()
+        badge, tone = (("录制中", "recording") if self._recording else
+                       ("待标注", "pending") if self._awaiting_label else
+                       ("可以录制", "ready") if teleop else ("未就绪", "idle"))
+        self.record_badge.setText(badge)
+        self.record_badge.setProperty("tone", tone)
+        self.record_badge.style().unpolish(self.record_badge)
+        self.record_badge.style().polish(self.record_badge)
         self.rec_start.setEnabled(teleop and not self._awaiting_label and not self._recording)
         self.rec_stop.setEnabled(teleop and self._recording)
         self.rec_ok.setEnabled(teleop and self._awaiting_label)

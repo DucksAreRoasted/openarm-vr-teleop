@@ -15,6 +15,7 @@ QWidget {
 QMainWindow, QDialog {
     background: #eef2f6;
 }
+QWidget#Workspace { background: #eef2f6; }
 QLabel#HeroTitle {
     font-size: 24px;
     font-weight: 700;
@@ -73,7 +74,7 @@ QPushButton {
     border: 1px solid #bcccdc;
     border-radius: 7px;
     padding: 9px 16px;
-    min-height: 34px;
+    min-height: 22px;
     font-size: 15px;
 }
 QPushButton:hover {
@@ -116,6 +117,42 @@ QPushButton#Accent {
     border: 1px solid #a5f3fc;
     font-weight: 600;
 }
+QPushButton#Success {
+    background: #ecfdf5;
+    color: #166534;
+    border-color: #a7d7bc;
+}
+QPushButton#Success:hover { background: #d1fae5; }
+QPushButton#Success:disabled, QPushButton#Danger:disabled {
+    color: #9aa8b5;
+    background: #f0f4f8;
+    border-color: #e0e6ed;
+}
+QFrame#ShortcutCard {
+    background: #f0f7fa;
+    border: 1px solid #d6e8ef;
+    border-radius: 8px;
+}
+QLabel#ShortcutTitle { color: #155e75; font-weight: 600; }
+QLabel#RecordBadge {
+    background: #eef2f6;
+    color: #627d98;
+    border-radius: 10px;
+    padding: 4px 10px;
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel#RecordBadge[tone="ready"] { background: #dcfce7; color: #166534; }
+QLabel#RecordBadge[tone="recording"] { background: #fee2e2; color: #b91c1c; }
+QLabel#RecordBadge[tone="pending"] { background: #fef3c7; color: #92400e; }
+QProgressBar {
+    border: none;
+    border-radius: 5px;
+    background: #dfe8ef;
+    min-height: 12px;
+    text-align: center;
+}
+QProgressBar::chunk { background: #0e7490; border-radius: 5px; }
 QRadioButton, QCheckBox {
     spacing: 10px;
     font-size: 15px;
