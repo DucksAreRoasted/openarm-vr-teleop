@@ -1,0 +1,2 @@
+# Optional USB / serial KER input. Quest teleoperation does not need this SDK.
+openarm-ker==0.3.0

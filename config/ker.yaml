@@ -1,0 +1,73 @@
+calibrated: false
+left:
+  channels:
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  signs:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  zero_degrees:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  offset_rad:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  gripper_channel: 15
+  gripper_open_degrees: 0.010986328125
+  gripper_closed_degrees: 61.65716552734375
+right:
+  channels:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  signs:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  zero_degrees:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  offset_rad:
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  - 0
+  gripper_channel: 7
+  gripper_open_degrees: -0.648193359375
+  gripper_closed_degrees: -61.37150573730469

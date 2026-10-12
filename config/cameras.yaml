@@ -1,0 +1,12 @@
+# Gemini 335 cameras. usb is the sysfs port (for example 2-1.4).
+# The teleop window fills this by reading the USB bus.
+cameras:
+  - name: head
+    usb: "2-4"
+    serial: "CP0X663000JF"
+  - name: wrist_left
+    usb: ""
+    serial: ""
+  - name: wrist_right
+    usb: ""
+    serial: ""

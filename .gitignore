@@ -1,0 +1,17 @@
+build/
+.venv/
+.venv-ker/
+recordings/
+__pycache__/
+*.pyc
+ros2/build/
+ros2/install/
+ros2/log/
+quest/quest_key.pem
+quest/quest_cert.pem
+install/
+log/
+MUJOCO_LOG.TXT
+config/*.bak.*
+config/*.backup*
+config/*.before-*
