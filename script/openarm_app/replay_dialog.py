@@ -20,6 +20,17 @@ from PySide6.QtWidgets import (
 from .services import ROOT
 from .theme import fit_window
 
+# 控制端日后可能在进度行追加 loop=<n> loops=<总数或 inf>；字段缺失时回退到界面状态。
+_PHASE_LABELS = {
+    "aligning": "接入首帧",
+    "playing": "回放中",
+    "paused": "已暂停",
+    "complete": "已完成，保持末帧",
+}
+_PROGRESS_RE = re.compile(r"PROGRESS time=([\d.eE+-]+) duration=([\d.eE+-]+) phase=(\w+)")
+_LOOP_RE = re.compile(r"(?<![A-Za-z])loop\s*=\s*(\d+)\b")
+_LOOPS_RE = re.compile(r"loops\s*=\s*(inf|\d+)\b", re.IGNORECASE)
+
 
 class TrajectoryPath(QLineEdit):
     def __init__(self, text: str = "") -> None:
@@ -245,14 +256,26 @@ class ReplayDialog(QDialog):
                 if cycle: self._cycle = int(cycle[1])
                 self.status.setText("正在慢速接入首帧…")
             if "[replay] PLAYING" in line: self._playing = True
-            match = re.search(r"PROGRESS time=([\d.e+-]+) duration=([\d.e+-]+) phase=(\w+)", line)
+            match = _PROGRESS_RE.search(line)
             if match and not self._stopping:
                 instant, duration = float(match[1]), float(match[2])
-                phase = {"aligning": "接入首帧", "playing": "回放中", "paused": "已暂停", "complete": "已完成，保持末帧"}[match[3]]
-                self.progress.setValue(int(1000*instant/duration) if duration > 0 else 0)
-                self.status.setText(f"第 {self._cycle} 遍 · {phase}  {instant:.1f} / {duration:.1f} 秒")
+                self.progress.setValue(int(1000 * instant / duration) if duration > 0 else 0)
+                self.status.setText(self._format_progress(line, match[3], instant, duration))
             if "[replay] COMPLETE" in line: self._complete = True
         self._update_controls()
+
+    def _format_progress(self, line: str, phase: str, instant: float, duration: float) -> str:
+        loop = _LOOP_RE.search(line)
+        loops = _LOOPS_RE.search(line)
+        if loop:
+            self._cycle = int(loop.group(1))
+        if loops:
+            raw = loops.group(1)
+            total = "∞" if raw.lower() == "inf" or int(raw) == 0 else str(int(raw))
+        else:
+            total = "∞" if self.repeat.value() == 0 else str(self.repeat.value())
+        label = _PHASE_LABELS.get(phase, phase)
+        return f"第 {self._cycle} / {total} 遍 · {label}  {instant:.1f} / {duration:.1f} 秒"
 
     def _pause(self) -> None:
         if not self.pause.isEnabled(): return

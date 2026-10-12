@@ -6,11 +6,13 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QTextCursor
@@ -57,6 +59,13 @@ from .services import (
 )
 from .theme import APP_STYLE, fit_window
 
+# Quest 回包必须立刻返回：quest_bridge 对 UDP 47934 只等约 0.8 秒，不能弹模态框。
+QUEST_NOT_READY_MESSAGE = "遥操尚未就绪，暂时不能录制。"
+REDO_ARM_MESSAGE = "再长按一次确认重录(5 秒内)"
+REDO_ARM_SECONDS = 5.0
+# 行首锚定。启动动作结束后控制端打印这两句之一，见 openarm_quest_cartesian_control.cpp。
+_QUEST_RUNNING_RE = re.compile(r"(?m)^\[quest-cartesian\] (?:bimanual )?running\.\s*$")
+
 
 class WorkerBridge(QObject):
     finished_ok = Signal()
@@ -65,6 +74,7 @@ class WorkerBridge(QObject):
     calib_log = Signal(str)
     motor_done = Signal(bool, str)
     idle = Signal(str)
+    stop_stuck = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -79,6 +89,8 @@ class MainWindow(QMainWindow):
         self._can_redo = False
         self._recording = False
         self._mirror_ready = False
+        self._quest_ready = False
+        self._redo_armed_until = 0.0
         self._usb_by_label: dict = {}
         self._data_dialog: DataManageDialog | None = None
         self.bridge = WorkerBridge()
@@ -88,6 +100,7 @@ class MainWindow(QMainWindow):
         self.bridge.calib_log.connect(self._calib_log_line)
         self.bridge.motor_done.connect(self._read_motor_params_done)
         self.bridge.idle.connect(self._idle)
+        self.bridge.stop_stuck.connect(self._stop_stuck)
         self._calib_proc: subprocess.Popen[str] | None = None
 
         self._build()
@@ -120,26 +133,58 @@ class MainWindow(QMainWindow):
             message = "当前不能执行此采集操作，请检查录制状态。"
             try:
                 action = json.loads(bytes(datagram.data())).get("action")
-                button = {
-                    "left-short": self.rec_stop if self._recording else self.rec_start,
-                    "left-long": self.rec_redo,
-                    "right-short": self.rec_ok,
-                    "right-long": self.rec_bad,
-                }.get(action)
-                if (self._mode() in ("sim", "real") and self._record_available()
-                        and button is not None and button.isEnabled()
-                        and not (action == "left-long" and self._recording)):
-                    if action == "left-short" and not self._recording and not self.batch_edit.text().strip():
-                        message = "请先在控制台填写批次名称。"
-                    else:
-                        kind = {"left-short": "stop" if self._recording else "start",
-                                "left-long": "redo", "right-short": "success", "right-long": "fail"}[action]
-                        ok = self._record(kind, quiet=True)
-                        message = self.record_hint.text()
+                # 其他手势取消尚未确认的重录，避免标注或开新条之后误丢数据。
+                if action != "left-long":
+                    self._redo_armed_until = 0.0
+                if self._capture_blocked_by_startup():
+                    message = QUEST_NOT_READY_MESSAGE
+                else:
+                    ok, message = self._dispatch_capture(action, message)
             except (ValueError, AttributeError, TypeError):
                 message = "无效的采集快捷键请求。"
             reply = json.dumps({"ok": ok, "message": message}, ensure_ascii=False).encode()
             self._capture_socket.writeDatagram(reply, datagram.senderAddress(), datagram.senderPort())
+
+    def _capture_blocked_by_startup(self) -> bool:
+        if self._mode() not in ("sim", "real") or self._quest_ready:
+            return False
+        return self._running() or self.status.text() in ("正在启动…", "启动中…")
+
+    def _dispatch_capture(self, action: str | None, message: str) -> tuple[bool, str]:
+        button = {
+            "left-short": self.rec_stop if self._recording else self.rec_start,
+            "left-long": self.rec_redo,
+            "right-short": self.rec_ok,
+            "right-long": self.rec_bad,
+        }.get(action)
+        allowed = (
+            self._mode() in ("sim", "real")
+            and self._record_available()
+            and button is not None
+            and button.isEnabled()
+            and not (action == "left-long" and self._recording)
+        )
+        if not allowed:
+            return False, message
+        if action == "left-long":
+            return self._redo_from_controller()
+        if action == "left-short" and not self._recording and not self.batch_edit.text().strip():
+            return False, "请先在控制台填写批次名称。"
+        kind = {
+            "left-short": "stop" if self._recording else "start",
+            "right-short": "success",
+            "right-long": "fail",
+        }[action]
+        return self._record(kind, quiet=True), self.record_hint.text()
+
+    def _redo_from_controller(self) -> tuple[bool, str]:
+        now = time.monotonic()
+        if now >= self._redo_armed_until:
+            self._redo_armed_until = now + REDO_ARM_SECONDS
+            self.record_hint.setText(REDO_ARM_MESSAGE)
+            return False, REDO_ARM_MESSAGE
+        self._redo_armed_until = 0.0
+        return self._record("redo", quiet=True), self.record_hint.text()
 
     def _build(self) -> None:
         central = QWidget()
@@ -404,7 +449,7 @@ class MainWindow(QMainWindow):
         shortcuts.setObjectName("ShortcutCard")
         shortcut_grid = QGridLayout(shortcuts)
         for column, (hand, short, long) in enumerate((
-            ("左摇杆", "短按  开始 / 结束录制", "长按  丢弃重录"),
+            ("左摇杆", "短按  开始 / 结束录制", "长按两次  确认重录"),
             ("右摇杆 · 停录后", "短按  标记成功", "长按  标记失败"),
         )):
             heading = QLabel(hand)
@@ -414,7 +459,7 @@ class MainWindow(QMainWindow):
                 label = QLabel(text)
                 label.setWordWrap(True)
                 shortcut_grid.addWidget(label, row, column)
-        note = QLabel("长按 1 秒后松开 · A/B、X/Y 控制夹爪")
+        note = QLabel("长按 1 秒后松开；重录需在 5 秒内再长按一次。A/B、X/Y 控制夹爪")
         note.setObjectName("Hint")
         note.setWordWrap(True)
         shortcut_grid.addWidget(note, 3, 0, 1, 2)
@@ -432,7 +477,7 @@ class MainWindow(QMainWindow):
         self.rec_stop.setToolTip('结束本段录制，随后选择成功、失败或重新录制。')
         self.rec_ok.setToolTip('将刚结束的录制标记为成功并保存。')
         self.rec_bad.setToolTip('将刚结束的录制标记为失败并保存。')
-        self.rec_redo.setToolTip('放弃本次录制并重新开始。')
+        self.rec_redo.setToolTip('放弃本次录制并重新开始。按钮会先确认；手柄需在 5 秒内再长按一次。')
         self.btn_data_manage.setToolTip('浏览已录制数据，查看标签并管理或导出记录。')
 
         # Log
@@ -477,8 +522,13 @@ class MainWindow(QMainWindow):
 
     def _record_available(self) -> bool:
         mode = self._mode()
-        return (self._running() and mode not in ("moveit", "zerog")
-                and (mode not in ("mirror", "ker_sim", "ker_real") or self._mirror_ready))
+        if not self._running() or mode in ("moveit", "zerog"):
+            return False
+        if mode in ("mirror", "ker_sim", "ker_real"):
+            return self._mirror_ready
+        if mode in ("sim", "real"):
+            return self._quest_ready
+        return False
 
     def _set_can_enabled(self, enabled: bool) -> None:
         for w in (
@@ -717,7 +767,7 @@ class MainWindow(QMainWindow):
         elif mode in ("ker_sim", "ker_real"):
             self.status.setText("正在启动 KER…")
         else:
-            self.status.setText("正在配置并启动…")
+            self.status.setText("正在启动…")
         self.btn_start.setEnabled(False)
         self.btn_ker_triggers.setEnabled(False)
         self._quest_skeleton_requested = self.quest_skeleton.isChecked()
@@ -748,6 +798,8 @@ class MainWindow(QMainWindow):
 
     def _spawn(self, mode: str, left: str, right: str) -> None:
         self._mirror_ready = False
+        self._quest_ready = False
+        self._redo_armed_until = 0.0
         environment = os.environ.copy()
         environment["OPENARM_RECORD_PANEL"] = "0"
         environment["OPENARM_LEFT_FOLLOWER_CAN"] = left
@@ -796,7 +848,12 @@ class MainWindow(QMainWindow):
             kind = "KER 真机" if mode == "ker_real" else "KER 仿真"
         else:
             kind = {"real": "真机", "sim": "仿真"}.get(mode, "仿真")
-        self.status.setText(f"{kind}编译/启动中…" if mode in ("mirror", "ker_sim", "ker_real") else f"{kind}运行中")
+        if mode in ("mirror", "ker_sim", "ker_real"):
+            self.status.setText(f"{kind}编译/启动中…")
+        elif mode in ("sim", "real"):
+            self.status.setText("启动中…")
+        else:
+            self.status.setText(f"{kind}运行中")
         if mode == "zerog":
             self.record_hint.setText("零重力已托住双臂。可用「重力」分区微调；不录遥操数据。")
         elif mode == "mirror":
@@ -809,18 +866,28 @@ class MainWindow(QMainWindow):
             self.record_hint.setText("MoveIt 实机：规划验证后可用「重力」分区热加载参数。")
         elif mode == "moveit":
             self.record_hint.setText("MoveIt 仿真只在 RViz 里动模型，不录遥操数据。")
-        elif mode in ("sim", "real") and self._quest_skeleton_requested:
-            self.record_hint.setText("肘腕模式：确认左右追踪有效后握持 Grip。短暂丢帧保持并自动重新接入；持续丢失后需松开并重新握持。")
+        elif mode in ("sim", "real"):
+            self.record_hint.setText(QUEST_NOT_READY_MESSAGE)
         else:
             self.record_hint.setText("可以开始录。停下来之后选择成功、失败或重录。")
         self._awaiting_label = False
         self._recording = False
         self._can_redo = False
+        self._redo_armed_until = 0.0
         self._apply_record_state()
         self._poll_timer.start()
         self._sync_data_dialog()
+        if mode in ("sim", "real"):
+            self._refresh_log()
+
+    def _quest_ready_hint(self) -> str:
+        if self._quest_skeleton_requested:
+            return "肘腕模式：确认左右追踪有效后握持 Grip。短暂丢帧保持并自动重新接入；持续丢失后需松开并重新握持。"
+        return "可以开始录。停下来之后选择成功、失败或重录。"
 
     def _fail(self, text: str) -> None:
+        self._quest_ready = False
+        self._redo_armed_until = 0.0
         self.status.setText("启动失败")
         self.btn_start.setEnabled(True)
         self._apply_mode()
@@ -834,18 +901,37 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
 
         def work() -> None:
+            stuck = False
             try:
                 os.killpg(proc.pid, signal.SIGINT)
                 try:
                     proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
                     os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=3)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        stuck = True
             except ProcessLookupError:
-                pass
-            self.bridge.idle.emit("已停止")
+                stuck = False
+            except OSError:
+                stuck = proc.poll() is None
+            if stuck:
+                self.bridge.stop_stuck.emit("释放超时，进程仍在运行。可再次停止。")
+            else:
+                self.bridge.idle.emit("已停止")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _stop_stuck(self, text: str) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            self._idle("已停止")
+            return
+        self.status.setText(text)
+        self._apply_record_state()
 
     def _idle(self, text: str) -> None:
         self.proc = None
@@ -853,6 +939,8 @@ class MainWindow(QMainWindow):
         self._awaiting_label = False
         self._recording = False
         self._can_redo = False
+        self._quest_ready = False
+        self._redo_armed_until = 0.0
         self.status.setText(text)
         self.record_hint.setText("启动之后才能录。停下来再标成功、失败，或重录。")
         self._poll_timer.stop()
@@ -896,6 +984,14 @@ class MainWindow(QMainWindow):
         elif self._mode() == "mirror" and not self._mirror_ready and "[mirror] READY:" in text:
             self.status.setText("同向示教：左臂正在慢速对齐…")
             self.record_hint.setText("控制器已就绪，等待左臂对齐；出现 TRACKING 后开放录制。")
+        elif self._mode() in ("sim", "real") and not self._quest_ready and self._running():
+            if _QUEST_RUNNING_RE.search(text):
+                self._quest_ready = True
+                kind = "真机" if self._mode() == "real" else "仿真"
+                self.status.setText(f"{kind}运行中")
+                self.record_hint.setText(self._quest_ready_hint())
+                self._apply_record_state()
+                self._sync_data_dialog()
         tail = "\n".join(text.splitlines()[-80:])
         self.log.setPlainText(tail)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
@@ -1167,6 +1263,8 @@ class MainWindow(QMainWindow):
     def _record(self, kind: str, *, quiet: bool = False) -> bool:
         if not self._record_available():
             return False
+        if kind != "redo":
+            self._redo_armed_until = 0.0
         try:
             if kind == "start":
                 name = self.batch_edit.text().strip()
@@ -1205,6 +1303,10 @@ class MainWindow(QMainWindow):
                 self.record_hint.setText("已标为失败。可以录下一条，或重录刚刚这一条。")
                 self._sync_data_dialog()
             elif kind == "redo":
+                if not quiet and not self._confirm_discard_redo():
+                    self._redo_armed_until = 0.0
+                    return False
+                self._redo_armed_until = 0.0
                 send_record("redo")
                 self._awaiting_label = False
                 self._recording = False
@@ -1219,6 +1321,13 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.critical(self, "录制", str(error))
             return False
+
+    def _confirm_discard_redo(self) -> bool:
+        return QMessageBox.question(
+            self,
+            "丢弃重录",
+            "将丢弃刚刚这一条录制，下一次开始会复用同一个序号。确定重录？",
+        ) == QMessageBox.StandardButton.Yes
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._running():
