@@ -1,0 +1,40 @@
+# 控制台默认使用这份期限。它晚于机械臂内部的超时，被挡住时由机械臂判定，规划不会先取消。
+# 文件名故意不以 _controllers.yaml 结尾，避免 MoveItConfigsBuilder 在多文件时猜错。
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+moveit_manage_controllers: true
+
+trajectory_execution:
+  allowed_execution_duration_scaling: 5.0
+  allowed_goal_duration_margin: 5.0
+  allowed_start_tolerance: 0.08
+
+moveit_simple_controller_manager:
+  controller_names:
+    - left_arm_controller
+    - right_arm_controller
+
+  left_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - openarm_left_joint1
+      - openarm_left_joint2
+      - openarm_left_joint3
+      - openarm_left_joint4
+      - openarm_left_joint5
+      - openarm_left_joint6
+      - openarm_left_joint7
+
+  right_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - openarm_right_joint1
+      - openarm_right_joint2
+      - openarm_right_joint3
+      - openarm_right_joint4
+      - openarm_right_joint5
+      - openarm_right_joint6
+      - openarm_right_joint7

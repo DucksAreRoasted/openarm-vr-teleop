@@ -1,0 +1,40 @@
+#pragma once
+
+#include <controller/quest_types.hpp>
+#include <controller/dynamics.hpp>
+#include <robot_state.hpp>
+
+#include <chrono>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+
+class TeleopTrajectoryLogger {
+public:
+    static TeleopTrajectoryLogger& shared();
+
+    void configure_from_env();
+    bool enabled() const { return enabled_; }
+
+    void log(const std::string& arm_label, Dynamics* dynamics, TeleopControlState state,
+             bool grip, const Eigen::Vector3d& tcp_target,
+             const std::vector<JointState>& measured, const std::vector<JointState>& reference,
+             const std::vector<double>* joint_target = nullptr,
+             const Eigen::Vector3d* requested_tcp = nullptr, double ik_ms = 0.0,
+             const Eigen::Matrix3d* requested_rotation = nullptr);
+
+    void close();
+
+private:
+    TeleopTrajectoryLogger() = default;
+
+    std::ofstream& stream_for(const std::string& arm_label, size_t dof);
+    static const char* state_name(TeleopControlState state);
+
+    bool enabled_ = false;
+    std::string log_dir_;
+    std::chrono::steady_clock::time_point t0_;
+    bool t0_initialized_ = false;
+    std::unordered_map<std::string, std::ofstream> files_;
+    std::unordered_map<std::string, bool> header_written_;
+};

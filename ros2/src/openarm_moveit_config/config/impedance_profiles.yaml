@@ -1,0 +1,75 @@
+# 关节阻抗档位。P0 等于改档位表之前的编译期常量。
+# 启动时逐项校验：0 ≤ kp ≤ 500，0 < kd ≤ 5，越界拒绝启动，不截断。
+# P-stop 不用表稿里的 kp=0：定稿是 J1–J4 kp=5、腕部 kp 1–2，急停后仍能手推。
+# drag 才是 kp=0 的手拖档，kd 仍大于 0，不作为急停。
+# J1/J2 在 P0–P2 的 kd 受电机上限 5 约束，阻尼比偏低；振荡时优先降 kp，不要把 kd 写成超过 5。
+profiles:
+  P0:
+    kp: [55, 55, 55, 55, 16, 14, 14]
+    kd: [1.3, 1.3, 1.3, 1.3, 0.35, 0.28, 0.35]
+    integral: legacy
+    stall: 0.18
+    slow: 0.10
+    settle: 0.05
+    duration_scale: 3.0
+    duration_margin: 2.0
+    gain_ramp_s: 0.5
+  P1:
+    kp: [40, 40, 40, 40, 12, 10, 10]
+    kd: [1.5, 1.5, 1.5, 1.5, 0.30, 0.25, 0.30]
+    integral: gated
+    stall: 0.20
+    slow: 0.12
+    settle: 0.06
+    duration_scale: 3.0
+    duration_margin: 2.0
+    gain_ramp_s: 0.5
+  P2:
+    kp: [25, 25, 25, 25, 8, 7, 7]
+    kd: [1.2, 1.2, 1.2, 1.2, 0.25, 0.20, 0.25]
+    restore_tau_max: [0, 0, 0, 0, 0, 0.12, 0]
+    restore_kd: [0, 0, 0, 0, 0, 0.10, 0]
+    restore_width: 0.025
+    integral: frozen
+    stall: 0.25
+    slow: 0.15
+    settle: 0.08
+    duration_scale: 4.0
+    duration_margin: 3.0
+    gain_ramp_s: 0.5
+  P3:
+    kp: [12, 12, 12, 12, 5, 4, 4]
+    kd: [0.9, 0.9, 0.9, 0.9, 0.20, 0.15, 0.20]
+    # J6 的位置弹簧，不积累积分；cap*tanh(error/width)，零误差时力矩为零。
+    # 把 restore_tau_max 全设为 0 可关闭额外弹簧（restore_kd 可单独保留阻尼）。
+    restore_tau_max: [0, 0, 0, 0, 0, 0.20, 0]
+    restore_kd: [0, 0, 0, 0, 0, 0.15, 0]
+    restore_width: 0.025
+    # 不积累静差补偿，避免低刚度下蓄力突破静摩擦后反复滑动。
+    integral: off
+    stall: 0.30
+    slow: 0.20
+    settle: 0.12
+    duration_scale: 4.0
+    duration_margin: 3.0
+    gain_ramp_s: 0.5
+  P-stop:
+    kp: [5, 5, 5, 5, 2, 1.5, 1.5]
+    kd: [2, 2, 2, 2, 0.3, 0.3, 0.3]
+    integral: off
+    stall: 0.30
+    slow: 0.20
+    settle: 0.12
+    duration_scale: 4.0
+    duration_margin: 3.0
+    gain_ramp_s: 0.2
+  drag:
+    kp: [0, 0, 0, 0, 0, 0, 0]
+    kd: [2, 2, 2, 2, 0.3, 0.3, 0.3]
+    integral: off
+    stall: 0.30
+    slow: 0.20
+    settle: 0.12
+    duration_scale: 4.0
+    duration_margin: 3.0
+    gain_ramp_s: 0.5

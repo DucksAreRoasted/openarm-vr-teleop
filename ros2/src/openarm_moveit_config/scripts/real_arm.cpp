@@ -1,0 +1,1356 @@
+// FollowJointTrajectory on the real OpenArm CAN arms, and publish /joint_states.
+#include <openarm/can/socket/openarm.hpp>
+#include <openarm/damiao_motor/dm_motor_constants.hpp>
+
+#include <controller/dynamics.hpp>
+#include <controller/gravity_comp.hpp>
+#include <controller/s_curve.hpp>
+#include <openarm_port/can_feedback.hpp>
+
+#include "impedance_profile.hpp"
+#include "impedance_hold.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include <control_msgs/action/follow_joint_trajectory.hpp>
+#include <rclcpp/callback_group.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+namespace {
+
+// Position gains for trajectory tracking (Nm/rad, Nm·s/rad).
+constexpr std::array<double, 7> KP{55.0, 55.0, 55.0, 55.0, 16.0, 14.0, 14.0};
+constexpr std::array<double, 7> KD{1.3, 1.3, 1.3, 1.3, 0.35, 0.28, 0.35};
+// Hold-only integral (Nm/(rad·s)) — kills static droop that PD+G(q) leaves.
+constexpr std::array<double, 7> KI{12.0, 12.0, 10.0, 10.0, 5.0, 4.0, 4.0};
+constexpr std::array<double, 7> kIntegralTauLimit{6.0, 6.0, 4.0, 4.0, 1.5, 1.2, 1.2};
+// MoveIt tracking τ_ff clamps (wider than zero-g defaults so gravity isn't clipped).
+constexpr std::array<double, 7> kMoveItTauFfLimits{25.0, 25.0, 20.0, 20.0, 5.0, 5.0, 5.0};
+constexpr double kControlDt = 0.01;
+constexpr double kHoldVelThresh = 0.12;  // rad/s — only integrate when nearly still
+constexpr double GRIPPER_KP = 10.0;
+constexpr double GRIPPER_KD = 0.5;
+
+using Follow = control_msgs::action::FollowJointTrajectory;
+using GoalHandle = rclcpp_action::ServerGoalHandle<Follow>;
+
+#ifndef OPENARM_URDF_PATH
+#define OPENARM_URDF_PATH ""
+#endif
+#ifndef OPENARM_ROOT
+#define OPENARM_ROOT ""
+#endif
+
+constexpr double kFingerComX = 0.0;
+constexpr double kFingerComY = 0.0;
+constexpr double kFingerComZ = 0.1025 + 0.045;
+
+void apply_gravity_model(Dynamics* dynamics, const GravityModel& model, const std::string& side,
+                         bool reinit_links = false) {
+    if (dynamics == nullptr) {
+        return;
+    }
+    const auto& scales = link_mass_scales_for(model, side);
+    dynamics->SetLinkMassScales(scales);
+    dynamics->SetLinkComDeltas(link_com_deltas_for(model, side));
+    if (reinit_links) {
+        if (!dynamics->ReinitWithMassScales(scales)) {
+            RCLCPP_WARN(rclcpp::get_logger("real_arm"),
+                        "ReinitWithMassScales failed for %s — still applying distal/camera knobs",
+                        side.c_str());
+        }
+    }
+    dynamics->SetUrdfGravityScale(model.urdf_scale);
+    dynamics->SetEndEffectorPointMass(end_effector_mass_for(model, side), kFingerComX,
+                                      kFingerComY, kFingerComZ);
+    const auto& off =
+        (side == "left") ? model.wrist_camera_offset_left : model.wrist_camera_offset_right;
+    dynamics->SetWristCameraMass(wrist_camera_mass_for(model, side), side == "left",
+                               off[0], off[1], off[2]);
+    dynamics->SetDistalMassGains(model.distal_ee_gain, model.distal_cam_gain);
+}
+
+bool load_gravity_yaml_file(const std::string& path, GravityTune* left, GravityTune* right,
+                            GravityModel* model) {
+    // Explicit zero friction and installation flags are part of the calibrated
+    // zero-g configuration, not missing values to replace with hidden defaults.
+    return load_gravity_yaml(path, left, right, model);
+}
+
+std::atomic<bool> g_reload_gravity{false};
+
+void on_hup(int) { g_reload_gravity = true; }
+
+double seconds_of(const builtin_interfaces::msg::Duration& stamp) {
+    return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
+}
+
+std::array<double, 7> param_array7(rclcpp::Node& node, const std::string& name,
+                                   const std::array<double, 7>& fallback) {
+    std::vector<double> defaults(fallback.begin(), fallback.end());
+    std::vector<double> values = defaults;
+    try {
+        values = node.declare_parameter<std::vector<double>>(name, defaults);
+    } catch (const std::exception& error) {
+        RCLCPP_WARN(node.get_logger(), "参数 %s 读取失败（%s），用默认值", name.c_str(),
+                    error.what());
+        values = defaults;
+        try {
+            if (!node.has_parameter(name)) {
+                node.declare_parameter(name, defaults);
+            }
+        } catch (...) {
+        }
+    }
+    std::array<double, 7> out = fallback;
+    for (size_t index = 0; index < out.size() && index < values.size(); ++index) {
+        out[index] = values[index];
+    }
+    return out;
+}
+
+struct Trajectory {
+    bool active = false;
+    // Virtual trajectory time (seconds). Advances slower / freezes when tracking
+    // error is large so external force cannot make q_cmd race ahead of the arm.
+    double virtual_time = 0.0;
+    std::vector<double> times;
+    std::vector<std::array<double, 7>> points;
+    // Optional per-sample joint velocities (same length as points when filled).
+    std::vector<std::array<double, 7>> velocities;
+};
+
+// Keep MoveIt knot times/poses; densify each segment with an S-shaped mix so
+// acceleration eases in/out without retiming the whole path (avoids timeout /
+// tracking abort from a longer schedule, and avoids stop-go rest-to-rest).
+Trajectory densify_trajectory_scurve(const Trajectory& input, double sample_dt) {
+    Trajectory out;
+    out.active = input.active;
+    if (input.points.size() < 2 || input.times.size() != input.points.size()) {
+        return input;
+    }
+
+    sample_dt = std::clamp(sample_dt, 0.002, 0.05);
+    out.times.push_back(input.times.front());
+    out.points.push_back(input.points.front());
+
+    for (size_t i = 1; i < input.points.size(); ++i) {
+        const double t0 = input.times[i - 1];
+        const double t1 = input.times[i];
+        const double T = std::max(t1 - t0, 1e-4);
+        const int steps = std::max(1, static_cast<int>(std::ceil(T / sample_dt)));
+        for (int step = 1; step <= steps; ++step) {
+            const double raw = static_cast<double>(step) / static_cast<double>(steps);
+            const double mix = openarm::scurve::unit_smooth(raw);
+            const double mix_dot = openarm::scurve::unit_smooth_dot(raw);  // d(mix)/d(raw)
+            std::array<double, 7> q{};
+            std::array<double, 7> dq{};
+            for (size_t j = 0; j < 7; ++j) {
+                const double delta = input.points[i][j] - input.points[i - 1][j];
+                q[j] = input.points[i - 1][j] + mix * delta;
+                // dq/dt = d(mix)/d(raw) * d(raw)/dt * delta
+                dq[j] = mix_dot * (delta / T);
+            }
+            out.times.push_back(t0 + raw * T);
+            out.points.push_back(q);
+            out.velocities.push_back(dq);
+        }
+    }
+    if (!out.velocities.empty()) {
+        out.velocities.back().fill(0.0);
+    }
+    return out;
+}
+
+// Tracking / recovery thresholds (rad).
+constexpr double kStallError = 0.18;     // freeze time progression
+constexpr double kSlowError = 0.10;      // slow time progression
+constexpr double kSettleError = 0.05;    // consider waypoint / goal reached
+constexpr double kStartWarpError = 0.05; // rewrite traj start to measured
+constexpr double kStartRejectError = 0.70; // plan too far from reality
+
+class ErrorLogger {
+public:
+    explicit ErrorLogger(const std::string& directory) {
+        if (directory.empty()) {
+            return;
+        }
+        std::filesystem::create_directories(directory);
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+        localtime_r(&tt, &tm);
+        std::ostringstream name;
+        name << directory << "/gravity_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".csv";
+        path_ = name.str();
+        file_.open(path_);
+        if (!file_) {
+            path_.clear();
+            return;
+        }
+        file_ << "t,side,traj";
+        for (int joint = 1; joint <= 7; ++joint) {
+            file_ << ",q_cmd" << joint << ",q_meas" << joint << ",e" << joint << ",dq" << joint
+                  << ",dq_meas" << joint << ",g_model" << joint << ",tau_ff" << joint << ",mtau"
+                  << joint << ",tau_ext" << joint << ",integral" << joint << ",kp" << joint
+                  << ",kd" << joint << ",spring" << joint;
+        }
+        file_ << ",profile,tau_clipped,gravity_gain\n";
+        file_.flush();
+    }
+
+    const std::string& path() const { return path_; }
+
+    void write(double t, const std::string& side, bool traj, const std::array<double, 7>& q_cmd,
+               const std::array<double, 7>& q_meas, const std::array<double, 7>& dq_cmd,
+               const std::array<double, 7>& dq_meas, const std::array<double, 7>& g_model,
+               const std::array<double, 7>& tau_ff, const std::array<double, 7>& mtau,
+               const std::array<double, 7>& tau_ext, const std::array<double, 7>& integral,
+               const std::array<double, 7>& kp, const std::array<double, 7>& kd,
+               const std::array<double, 7>& spring, const std::string& profile, bool clipped,
+               double gravity_gain) {
+        if (!file_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        file_ << std::fixed << std::setprecision(6) << t << "," << side << "," << (traj ? 1 : 0);
+        for (int joint = 0; joint < 7; ++joint) {
+            file_ << "," << q_cmd[joint] << "," << q_meas[joint] << ","
+                  << (q_cmd[joint] - q_meas[joint]) << "," << dq_cmd[joint] << "," << dq_meas[joint]
+                  << "," << g_model[joint] << "," << tau_ff[joint] << "," << mtau[joint] << ","
+                  << tau_ext[joint] << "," << integral[joint] << "," << kp[joint] << "," << kd[joint]
+                  << "," << spring[joint];
+        }
+        file_ << "," << profile << "," << (clipped ? 1 : 0) << "," << gravity_gain << "\n";
+    }
+
+    void flush() {
+        if (file_) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            file_.flush();
+        }
+    }
+
+private:
+    std::mutex mutex_;
+    std::ofstream file_;
+    std::string path_;
+};
+
+class ArmBus {
+public:
+    ArmBus(const std::string& can, const std::string& side, const std::string& urdf_path,
+           GravityTune tune, GravityModel model,
+           std::shared_ptr<ErrorLogger> logger, ImpedanceProfile profile, double external_gate_nm,
+           double stale_hold_s)
+        : side_(side),
+          tune_(tune),
+          model_(model),
+          logger_(std::move(logger)),
+          profile_(std::move(profile)),
+          external_gate_nm_(external_gate_nm),
+          stale_hold_s_(stale_hold_s) {
+        kp_ = profile_.kp;
+        kd_ = profile_.kd;
+        for (size_t index = 0; index < kd_.size(); ++index) {
+            kd_[index] += profile_.restore_kd[index];
+        }
+        restore_cap_ = profile_.restore_tau_max;
+        restore_target_ = restore_cap_;
+        restore_width_ = profile_.restore_width;
+        restore_width_target_ = restore_width_;
+        kp_target_ = profile_.kp;
+        kd_target_ = kd_;
+        gain_ramp_s_ = profile_.gain_ramp_s;
+        gain_ramp_left_ = 0.0;
+        stall_error_ = profile_.stall_error;
+        slow_error_ = profile_.slow_error;
+        settle_error_ = profile_.settle_error;
+        duration_scale_ = profile_.duration_scale;
+        duration_margin_ = profile_.duration_margin;
+        stop_profile_ = profile_;
+        hardware_ = std::make_unique<openarm::can::socket::OpenArm>(can, true);
+        const std::vector<openarm::damiao_motor::MotorType> types{
+            openarm::damiao_motor::MotorType::DM8009, openarm::damiao_motor::MotorType::DM8009,
+            openarm::damiao_motor::MotorType::DM4340, openarm::damiao_motor::MotorType::DM4340,
+            openarm::damiao_motor::MotorType::DM4310, openarm::damiao_motor::MotorType::DM4310,
+            openarm::damiao_motor::MotorType::DM4310};
+        hardware_->init_arm_motors(types, {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+                                   {0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17});
+        hardware_->init_gripper_motor(openarm::damiao_motor::MotorType::DM4310, 0x08, 0x18);
+        hardware_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
+        hardware_->enable_all();
+        enabled_ = true;
+        for (int cycle = 0; cycle < 20; ++cycle) {
+            hardware_->refresh_all();
+            hardware_->recv_all(2000);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        dynamics_ = std::make_unique<Dynamics>(urdf_path, "openarm_body_link0",
+                                               "openarm_" + side_ + "_link7");
+        dynamics_->SetLinkMassScales(link_mass_scales_for(model_, side_));
+        dynamics_->SetLinkComDeltas(link_com_deltas_for(model_, side_));
+        if (!dynamics_->Init()) {
+            dynamics_.reset();
+        } else {
+            apply_gravity_model(dynamics_.get(), model_, side_);
+        }
+        const CanFeedbackVerdict verdict = refresh_until_fresh(hardware_.get());
+        if (!verdict.ok) {
+            const std::string detail = format_can_feedback_verdict(verdict, "[real_arm] " + side_);
+            try {
+                hardware_->disable_all();
+            } catch (...) {
+            }
+            enabled_ = false;
+            throw std::runtime_error(detail + "；没有新鲜有效反馈，拒绝进入出力循环（不按 q=0 计算重力）");
+        }
+        read();
+        std::lock_guard<std::mutex> lock(mutex_);
+        command_ = measured_;
+        velocity_.fill(0.0);
+        gripper_hold_ = gripper_;
+        send_locked(0.0);
+    }
+
+    ~ArmBus() {
+        if (hardware_ && enabled_) {
+            hardware_->disable_all();
+            hardware_->recv_all(1000);
+        }
+    }
+
+    bool has_gravity() const { return dynamics_ != nullptr; }
+
+    void set_tune(const GravityTune& tune) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tune_ = tune;
+    }
+
+    void set_model(const GravityModel& model) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        model_ = model;
+        apply_gravity_model(dynamics_.get(), model_, side_, /*reinit_links=*/true);
+    }
+
+    std::array<double, 7> measured() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return measured_;
+    }
+
+    void hold_here() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        command_ = measured_;
+        velocity_.fill(0.0);
+        hold_integral_.reset();
+    }
+
+    void set_tau_publisher(rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr publisher) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tau_ext_pub_ = std::move(publisher);
+    }
+
+    void set_stop_profile(ImpedanceProfile profile) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_profile_ = std::move(profile);
+    }
+
+    void set_external_gate(double gate_nm) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        external_gate_nm_ = gate_nm;
+    }
+
+    void set_profile(const ImpedanceProfile& profile) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool hold_pose = profile.name == "P-stop" || profile.name == "drag";
+        apply_profile_locked(profile, /*snap=*/false, hold_pose);
+    }
+
+    bool pose_hold_active() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return profile_.name == "P-stop" || profile_.name == "drag";
+    }
+
+    uint64_t motion_epoch() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return motion_epoch_;
+    }
+
+    // True only for the trajectory that was running when soft-hold or drag began.
+    // A later goal gets a new epoch, so an idle stop does not cancel it.
+    bool consume_stop(uint64_t epoch) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (epoch == 0 || stop_epoch_ != epoch) {
+            return false;
+        }
+        stop_epoch_ = 0;
+        return true;
+    }
+
+    void set_force_feedback_stale(bool stale) { force_feedback_stale_ = stale; }
+
+    bool entered_soft_hold() {
+        const bool entered = soft_hold_entered_.exchange(false);
+        return entered;
+    }
+
+    double execution_timeout(double duration) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::max(2.0, duration * duration_scale_ + duration_margin_);
+    }
+
+    double settle_error() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return settle_error_;
+    }
+
+    bool faulted() const { return fault_; }
+    const std::string& fault_reason() const { return fault_reason_; }
+
+    bool spin_once(double t_sec) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!enabled_ || fault_) {
+            return false;
+        }
+        const CanFeedbackVerdict verdict =
+            evaluate_openarm_feedback(*hardware_, std::chrono::steady_clock::now());
+        const bool force_stale = force_feedback_stale_.load();
+        if (!verdict.ok && verdict.fault == CanFeedbackFault::ErrorCode) {
+            fail_locked(format_can_feedback_verdict(verdict, "[real_arm] " + side_) +
+                        "；电机错误码，立即失能");
+            return false;
+        }
+        const bool stale = force_stale || (!verdict.ok && verdict.fault != CanFeedbackFault::None);
+        if (stale && verdict.fault == CanFeedbackFault::NeverReceived && !force_stale) {
+            fail_locked(format_can_feedback_verdict(verdict, "[real_arm] " + side_) +
+                        "；从未收到反馈，立即失能");
+            return false;
+        }
+        if (stale) {
+            if (!stale_hold_) {
+                stale_hold_ = true;
+                stale_since_ = std::chrono::steady_clock::now();
+                q_at_stale_ = measured_;
+                // Snap to P-stop before this cycle's command. A ramp from P0 would
+                // still send kp 55 while feedback is already late.
+                apply_profile_locked(stop_profile_, /*snap=*/true, /*hold_pose=*/true);
+                soft_hold_entered_ = true;
+                RCLCPP_ERROR(rclcpp::get_logger("real_arm"),
+                             "%s 反馈中断，先软保持 %.0f ms，再失能", side_.c_str(),
+                             stale_hold_s_ * 1000.0);
+            }
+            send_locked(t_sec);
+            hardware_->recv_all(1000);
+            const double held =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - stale_since_)
+                    .count();
+            if (held >= stale_hold_s_) {
+                fail_locked(side_ + " 反馈在软保持窗口内没有恢复，disable_all");
+                return false;
+            }
+            return true;
+        }
+        if (stale_hold_) {
+            read_locked();
+            double drift = 0.0;
+            for (size_t index = 0; index < measured_.size(); ++index) {
+                drift = std::max(drift, std::abs(measured_[index] - q_at_stale_[index]));
+            }
+            stale_hold_ = false;
+            RCLCPP_WARN(rclcpp::get_logger("real_arm"),
+                        "%s 反馈恢复（偏离 %.3f rad），留在软保持，不恢复轨迹", side_.c_str(),
+                        drift);
+        }
+        send_locked(t_sec);
+        hardware_->recv_all(1000);
+        read_locked();
+        return true;
+    }
+
+    void fill(sensor_msgs::msg::JointState* message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int index = 0; index < 7; ++index) {
+            message->name.push_back("openarm_" + side_ + "_joint" + std::to_string(index + 1));
+            message->position.push_back(measured_[index]);
+        }
+        // Publish a planning-safe finger opening. Closed jaws self-collide in the
+        // URDF meshes and used to make the whole start state invalid for MoveIt.
+        // Gripper motor is still held via gripper_hold_; arm planning groups do
+        // not command the fingers.
+        constexpr double kPlanningFingerOpen = 0.02;
+        for (const char* joint : {"finger_joint1", "finger_joint2"}) {
+            message->name.push_back("openarm_" + side_ + "_" + joint);
+            message->position.push_back(kPlanningFingerOpen);
+        }
+    }
+
+    // Returns planned duration in seconds (after optional S-curve densify).
+    double set_trajectory(Trajectory trajectory) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (openarm::scurve::env_flag_enabled("OPENARM_MOVEIT_SCURVE", true) &&
+            trajectory.points.size() >= 2) {
+            trajectory_ = densify_trajectory_scurve(trajectory, kControlDt);
+        } else {
+            trajectory_ = std::move(trajectory);
+            trajectory_.velocities.clear();
+        }
+        trajectory_.virtual_time = 0.0;
+        last_track_wall_ = std::chrono::steady_clock::now();
+        motion_epoch_ += 1;
+        if (motion_epoch_ == 0) {
+            motion_epoch_ = 1;
+        }
+        if (!trajectory_.points.empty()) {
+            command_ = trajectory_.points.front();
+            velocity_.fill(0.0);
+        }
+        // A new target invalidates both the live and frozen pose-dependent bias.
+        hold_integral_.reset();
+        if (trajectory_.times.size() < 2) {
+            return 0.0;
+        }
+        return std::max(0.0, trajectory_.times.back() - trajectory_.times.front());
+    }
+
+    void clear_trajectory() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        trajectory_.active = false;
+        velocity_.fill(0.0);
+    }
+
+    void track(const rclcpp::Time& /*now*/) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!trajectory_.active || trajectory_.points.empty()) {
+            return;
+        }
+        const auto wall_now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double>(wall_now - last_track_wall_).count();
+        last_track_wall_ = wall_now;
+        dt = std::clamp(dt, 0.0, 0.05);
+
+        // Error vs the command we are already asking for.
+        double err = 0.0;
+        for (size_t i = 0; i < command_.size(); ++i) {
+            err = std::max(err, std::abs(command_[i] - measured_[i]));
+        }
+        // Time-warp: freeze / slow when the human (or obstacle) holds the arm.
+        double rate = 1.0;
+        if (err > stall_error_) {
+            rate = 0.0;
+        } else if (err > slow_error_) {
+            rate = 0.25;
+        }
+        trajectory_.virtual_time += dt * rate;
+        const double t_end = trajectory_.times.back();
+        if (trajectory_.virtual_time > t_end) {
+            trajectory_.virtual_time = t_end;
+        }
+        sample(trajectory_.virtual_time, &command_, &velocity_);
+
+        if (trajectory_.virtual_time >= t_end) {
+            velocity_.fill(0.0);
+            // Only finish after the arm actually catches the final point.
+            double final_err = 0.0;
+            for (size_t i = 0; i < command_.size(); ++i) {
+                final_err = std::max(final_err, std::abs(command_[i] - measured_[i]));
+            }
+            if (final_err < settle_error_) {
+                trajectory_.active = false;
+            }
+        }
+    }
+
+    bool trajectory_done() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !trajectory_.active;
+    }
+
+    double max_tracking_error() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        double err = 0.0;
+        for (size_t i = 0; i < command_.size(); ++i) {
+            err = std::max(err, std::abs(command_[i] - measured_[i]));
+        }
+        return err;
+    }
+
+private:
+    void read() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        read_locked();
+    }
+
+    void read_locked() {
+        const auto motors = hardware_->get_arm().get_motors();
+        for (size_t index = 0; index < motors.size() && index < measured_.size(); ++index) {
+            measured_[index] = motors[index].get_position();
+            measured_vel_[index] = motors[index].get_velocity();
+            measured_tau_[index] = motors[index].get_torque();
+        }
+        const auto gripper = hardware_->get_gripper().get_motors();
+        if (!gripper.empty()) {
+            gripper_ = gripper.front().get_position();
+        }
+    }
+
+    void fail_locked(const std::string& reason) {
+        RCLCPP_ERROR(rclcpp::get_logger("real_arm"), "%s", reason.c_str());
+        try {
+            hardware_->disable_all();
+        } catch (...) {
+        }
+        enabled_ = false;
+        fault_ = true;
+        fault_reason_ = reason;
+    }
+
+    void apply_profile_locked(const ImpedanceProfile& profile, bool snap, bool hold_pose) {
+        const IntegralMode previous = profile_.integral;
+        profile_ = profile;
+        kp_target_ = profile.kp;
+        kd_target_ = profile.kd;
+        for (size_t index = 0; index < kd_target_.size(); ++index) {
+            kd_target_[index] += profile.restore_kd[index];
+        }
+        restore_target_ = profile.restore_tau_max;
+        restore_width_target_ = profile.restore_width;
+        gain_ramp_s_ = profile.gain_ramp_s;
+        stall_error_ = profile.stall_error;
+        slow_error_ = profile.slow_error;
+        settle_error_ = profile.settle_error;
+        duration_scale_ = profile.duration_scale;
+        duration_margin_ = profile.duration_margin;
+        if (snap) {
+            kp_ = kp_target_;
+            kd_ = kd_target_;
+            restore_cap_ = restore_target_;
+            restore_width_ = restore_width_target_;
+            gain_ramp_left_ = 0.0;
+        } else {
+            gain_ramp_left_ = profile.gain_ramp_s;
+        }
+        if (hold_pose) {
+            // Soft stop and drag remove the extra spring immediately, even
+            // while the ordinary gain ramp is still finishing.
+            restore_cap_.fill(0.0);
+            // P-stop and drag must not keep chasing a MoveIt trajectory.
+            command_ = measured_;
+            velocity_.fill(0.0);
+            hold_integral_.reset();
+            trajectory_.active = false;
+            if (motion_epoch_ != 0) {
+                stop_epoch_ = motion_epoch_;
+            }
+            return;
+        }
+        if (profile.integral == IntegralMode::Frozen && previous != IntegralMode::Frozen) {
+            hold_integral_.freeze();
+        }
+        if (profile.integral != previous && profile.integral == IntegralMode::Off) {
+            hold_integral_.decay_s = 0.5;
+        } else if (previous == IntegralMode::Frozen && profile.integral != IntegralMode::Frozen) {
+            hold_integral_.decay_s = 1.0;
+        } else {
+            hold_integral_.decay_s = 0.0;
+        }
+    }
+
+    void ramp_gains_locked() {
+        if (gain_ramp_left_ <= 1e-4) {
+            kp_ = kp_target_;
+            kd_ = kd_target_;
+            restore_cap_ = restore_target_;
+            restore_width_ = restore_width_target_;
+            gain_ramp_left_ = 0.0;
+            return;
+        }
+        const double fraction = std::min(1.0, kControlDt / gain_ramp_left_);
+        for (size_t index = 0; index < kp_.size(); ++index) {
+            kp_[index] += (kp_target_[index] - kp_[index]) * fraction;
+            kd_[index] += (kd_target_[index] - kd_[index]) * fraction;
+            restore_cap_[index] += (restore_target_[index] - restore_cap_[index]) * fraction;
+        }
+        restore_width_ += (restore_width_target_ - restore_width_) * fraction;
+        gain_ramp_left_ = std::max(0.0, gain_ramp_left_ - kControlDt);
+    }
+
+    void send_locked(double t_sec) {
+        ramp_gains_locked();
+        std::array<double, 7> gravity{};
+        std::array<double, 7> tau_ff{};
+        std::array<double, 7> tau_ext{};
+        std::array<double, 7> spring{};
+        if (dynamics_) {
+            dynamics_->GetGravity(measured_.data(), gravity.data());
+        }
+        const bool holding = !trajectory_.active;
+        bool clipped = false;
+        std::vector<openarm::damiao_motor::MITParam> arm;
+        arm.reserve(7);
+        for (size_t index = 0; index < command_.size(); ++index) {
+            const double grav =
+                compose_gravity_torque(gravity[index], tune_, index, model_.ff_gain);
+            const double fric = friction_torque(measured_vel_[index], tune_.fc[index],
+                                               tune_.fv[index], tune_.fk[index]);
+            const double model_tau = grav + fric;
+            const double err = command_[index] - measured_[index];
+            const double vel_err = velocity_[index] - measured_vel_[index];
+            spring[index] = nonlinear_spring_torque(err, restore_cap_[index], restore_width_);
+            // Raw residual for the researcher's filter. It still contains the PD reaction.
+            tau_ext[index] = measured_tau_[index] - model_tau;
+            const double unexplained =
+                measured_tau_[index] -
+                (model_tau + spring[index] + kp_[index] * err + kd_[index] * vel_err);
+
+            const bool slow = std::abs(measured_vel_[index]) < kHoldVelThresh &&
+                              std::abs(velocity_[index]) < kHoldVelThresh;
+            const double limit = kIntegralTauLimit[index] *
+                                 (profile_.integral == IntegralMode::Gated ? 0.5 : 1.0);
+            if (hold_integral_.decay_s > 0.0) {
+                const double next = std::max(0.0, hold_integral_.decay_s - kControlDt);
+                hold_integral_.tau[index] *= hold_integral_.decay_s > 1e-6 ? next / hold_integral_.decay_s : 0.0;
+            } else if (profile_.integral == IntegralMode::Legacy) {
+                if (holding && slow) {
+                    hold_integral_.tau[index] += KI[index] * err * kControlDt;
+                    hold_integral_.tau[index] = std::clamp(hold_integral_.tau[index], -limit, limit);
+                } else {
+                    hold_integral_.tau[index] *= 0.92;
+                }
+            } else if (profile_.integral == IntegralMode::Gated) {
+                const bool small_error = std::abs(err) < 0.03;
+                const bool no_contact = std::abs(unexplained) < external_gate_nm_;
+                if (holding && slow && small_error && no_contact) {
+                    hold_integral_.tau[index] += KI[index] * err * kControlDt;
+                    hold_integral_.tau[index] = std::clamp(hold_integral_.tau[index], -limit, limit);
+                }
+            } else if (profile_.integral == IntegralMode::Frozen) {
+                hold_integral_.tau[index] = hold_integral_.frozen[index];
+            } else {
+                hold_integral_.tau[index] = 0.0;
+            }
+
+            double tau = model_tau + hold_integral_.tau[index] + spring[index];
+            const double ff_lim =
+                (index < kMoveItTauFfLimits.size()) ? kMoveItTauFfLimits[index] : 20.0;
+            tau = std::clamp(tau, -ff_lim, ff_lim);
+            const double total_lim = 0.8 * motor_tmax_nm()[index];
+            const double pd_mag = std::abs(kp_[index] * err) + std::abs(kd_[index] * vel_err);
+            if (pd_mag + std::abs(tau) > total_lim) {
+                const double room = std::max(0.0, total_lim - pd_mag);
+                const double scale = std::abs(tau) > 1e-9 ? room / std::abs(tau) : 0.0;
+                tau *= std::min(1.0, scale);
+                clipped = true;
+            }
+            tau_ff[index] = tau;
+            arm.push_back({kp_[index], kd_[index], command_[index], velocity_[index], tau_ff[index]});
+        }
+        if (clipped && (log_div_ % 50) == 0) {
+            RCLCPP_WARN(rclcpp::get_logger("real_arm"),
+                        "%s 估计总力矩超过电机 tMax 的 80%%，已缩小 τ_ff", side_.c_str());
+        }
+        if (hold_integral_.decay_s > 0.0) {
+            hold_integral_.decay_s = std::max(0.0, hold_integral_.decay_s - kControlDt);
+            if (hold_integral_.decay_s == 0.0) {
+                hold_integral_.tau.fill(0.0);
+            }
+        }
+        hardware_->get_arm().mit_control_all(arm);
+        hardware_->get_gripper().mit_control_all({{GRIPPER_KP, GRIPPER_KD, gripper_hold_, 0.0, 0.0}});
+        if (tau_ext_pub_) {
+            std_msgs::msg::Float64MultiArray message;
+            message.data.assign(tau_ext.begin(), tau_ext.end());
+            tau_ext_pub_->publish(message);
+        }
+        if (logger_ && (++log_div_ % 2) == 0) {
+            logger_->write(t_sec, side_, trajectory_.active, command_, measured_, velocity_,
+                           measured_vel_, gravity, tau_ff, measured_tau_, tau_ext, hold_integral_.tau,
+                           kp_, kd_, spring, profile_.name, clipped, model_.ff_gain);
+        }
+    }
+
+    void sample(double elapsed, std::array<double, 7>* position,
+                std::array<double, 7>* velocity) const {
+        const auto& times = trajectory_.times;
+        const auto& points = trajectory_.points;
+        const auto& vels = trajectory_.velocities;
+        const bool have_vel = vels.size() == points.size();
+        if (elapsed <= times.front()) {
+            *position = points.front();
+            *velocity = have_vel ? vels.front() : std::array<double, 7>{};
+            if (!have_vel) {
+                velocity->fill(0.0);
+            }
+            return;
+        }
+        if (elapsed >= times.back()) {
+            *position = points.back();
+            velocity->fill(0.0);
+            return;
+        }
+        auto upper = std::upper_bound(times.begin(), times.end(), elapsed);
+        const size_t next = static_cast<size_t>(upper - times.begin());
+        const size_t prev = next - 1;
+        const double span = times[next] - times[prev];
+        const double mix = span > 1e-6 ? (elapsed - times[prev]) / span : 1.0;
+        for (size_t index = 0; index < position->size(); ++index) {
+            (*position)[index] =
+                points[prev][index] + mix * (points[next][index] - points[prev][index]);
+            if (have_vel) {
+                (*velocity)[index] =
+                    vels[prev][index] + mix * (vels[next][index] - vels[prev][index]);
+            } else {
+                (*velocity)[index] =
+                    span > 1e-6 ? (points[next][index] - points[prev][index]) / span : 0.0;
+            }
+        }
+    }
+
+    std::string side_;
+    GravityTune tune_;
+    GravityModel model_;
+    std::shared_ptr<ErrorLogger> logger_;
+    std::unique_ptr<openarm::can::socket::OpenArm> hardware_;
+    std::unique_ptr<Dynamics> dynamics_;
+    std::mutex mutex_;
+    std::array<double, 7> measured_{};
+    std::array<double, 7> measured_vel_{};
+    std::array<double, 7> measured_tau_{};
+    std::array<double, 7> command_{};
+    std::array<double, 7> velocity_{};
+    HoldIntegralState hold_integral_;
+    std::array<double, 7> kp_{};
+    std::array<double, 7> kd_{};
+    std::array<double, 7> kp_target_{};
+    std::array<double, 7> kd_target_{};
+    std::array<double, 7> restore_cap_{};
+    std::array<double, 7> restore_target_{};
+    double restore_width_ = 0.025;
+    double restore_width_target_ = 0.025;
+    std::array<double, 7> q_at_stale_{};
+    ImpedanceProfile profile_;
+    ImpedanceProfile stop_profile_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr tau_ext_pub_;
+    double external_gate_nm_ = 0.8;
+    double stale_hold_s_ = 0.5;
+    double gain_ramp_s_ = 0.5;
+    double gain_ramp_left_ = 0.0;
+    double stall_error_ = kStallError;
+    double slow_error_ = kSlowError;
+    double settle_error_ = kSettleError;
+    double duration_scale_ = 3.0;
+    double duration_margin_ = 2.0;
+    double gripper_ = 0.0;
+    double gripper_hold_ = 0.0;
+    bool enabled_ = false;
+    bool fault_ = false;
+    bool stale_hold_ = false;
+    uint64_t motion_epoch_ = 0;
+    uint64_t stop_epoch_ = 0;
+    std::atomic<bool> force_feedback_stale_{false};
+    std::atomic<bool> soft_hold_entered_{false};
+    std::chrono::steady_clock::time_point stale_since_{};
+    std::string fault_reason_;
+    int log_div_ = 0;
+    Trajectory trajectory_;
+    std::chrono::steady_clock::time_point last_track_wall_{};
+};
+
+class RealArm : public rclcpp::Node {
+public:
+    RealArm() : Node("openarm_real_arm") {
+        const auto left = declare_parameter<std::string>("left_can", "can1");
+        const auto right = declare_parameter<std::string>("right_can", "can0");
+        const auto urdf = declare_parameter<std::string>("urdf_path", OPENARM_URDF_PATH);
+        const bool log_errors = declare_parameter<bool>("log_errors", true);
+        std::string default_log =
+            std::string(OPENARM_ROOT).empty()
+                ? std::string()
+                : (std::string(OPENARM_ROOT) + "/recordings/moveit_gravity");
+        std::string log_dir = declare_parameter<std::string>("error_log_dir", default_log);
+        if (log_dir.empty()) {
+            log_dir = default_log;
+        }
+        GravityTune left_tune;
+        GravityTune right_tune;
+        left_tune.scale = param_array7(*this, "left_gravity_scale", left_tune.scale);
+        left_tune.bias = param_array7(*this, "left_gravity_bias", left_tune.bias);
+        right_tune.scale = param_array7(*this, "right_gravity_scale", right_tune.scale);
+        right_tune.bias = param_array7(*this, "right_gravity_bias", right_tune.bias);
+        seed_default_friction(&left_tune);
+        seed_default_friction(&right_tune);
+        left_tune.fc = param_array7(*this, "left_friction_fc", left_tune.fc);
+        left_tune.fv = param_array7(*this, "left_friction_fv", left_tune.fv);
+        left_tune.fk = param_array7(*this, "left_friction_k", left_tune.fk);
+        right_tune.fc = param_array7(*this, "right_friction_fc", right_tune.fc);
+        right_tune.fv = param_array7(*this, "right_friction_fv", right_tune.fv);
+        right_tune.fk = param_array7(*this, "right_friction_k", right_tune.fk);
+        GravityModel model;
+        model.urdf_scale = declare_parameter<double>("urdf_gravity_scale", 1.0);
+        model.ee_payload_kg = declare_parameter<double>("ee_payload_kg", 0.0);
+        // Use the calibrated zero-g gravity output, including its gain.
+        model.ff_gain = declare_parameter<double>("g_scale", model.ff_gain);
+        try {
+            model.ff_gain = declare_parameter<double>("ff_gain", model.ff_gain);
+        } catch (...) {
+        }
+        // Accept the old parameter for launch compatibility; it no longer scales real_arm gravity.
+        declare_parameter<double>("tracking_g_scale", 1.00);
+        model.left_link_mass_scale =
+            param_array7(*this, "left_link_mass_scale", model.left_link_mass_scale);
+        model.right_link_mass_scale =
+            param_array7(*this, "right_link_mass_scale", model.right_link_mass_scale);
+        gravity_yaml_ = declare_parameter<std::string>(
+            "gravity_yaml",
+            std::string(OPENARM_ROOT).empty()
+                ? std::string()
+                : (std::string(OPENARM_ROOT) + "/config/gravity_comp.yaml"));
+
+        // Load tuned yaml BEFORE constructing ArmBus. Previously the path was only
+        // used for hot-reload, so distal/camera/urdf_scale never applied at startup.
+        if (!gravity_yaml_.empty()) {
+            if (load_gravity_yaml_file(gravity_yaml_, &left_tune, &right_tune, &model)) {
+                RCLCPP_INFO(get_logger(),
+                            "已加载重力 yaml：%s urdf_scale=%.3f gripper_motor=%.3f camera=%.3f "
+                            "g_scale=%.3f distal_ee=[%.2f..%.2f]",
+                            gravity_yaml_.c_str(), model.urdf_scale, model.gripper_motor_kg,
+                            model.wrist_camera_kg, model.ff_gain, model.distal_ee_gain[0],
+                            model.distal_ee_gain[6]);
+                try {
+                    yaml_mtime_ = std::filesystem::last_write_time(gravity_yaml_);
+                } catch (...) {
+                }
+            } else {
+                RCLCPP_WARN(get_logger(),
+                            "读不了重力 yaml：%s — 使用 ROS 参数/默认值（补偿会明显偏弱）",
+                            gravity_yaml_.c_str());
+            }
+        } else {
+            RCLCPP_WARN(get_logger(), "未设置 gravity_yaml，重力补偿仅用默认参数");
+        }
+
+        std::shared_ptr<ErrorLogger> logger;
+        if (log_errors) {
+            logger = std::make_shared<ErrorLogger>(log_dir);
+            if (!logger->path().empty()) {
+                RCLCPP_INFO(get_logger(), "误差/重力日志：%s", logger->path().c_str());
+            } else {
+                RCLCPP_WARN(get_logger(), "打不开误差日志目录：%s", log_dir.c_str());
+                logger.reset();
+            }
+        }
+
+        const auto profiles_file = declare_parameter<std::string>(
+            "impedance_profiles_file",
+            std::string(OPENARM_ROOT).empty()
+                ? std::string()
+                : (std::string(OPENARM_ROOT) +
+                   "/ros2/src/openarm_moveit_config/config/impedance_profiles.yaml"));
+        if (!profiles_file.empty() && std::filesystem::is_regular_file(profiles_file)) {
+            profiles_ = load_impedance_profiles(profiles_file);
+            RCLCPP_INFO(get_logger(), "已加载阻抗档位：%s", profiles_file.c_str());
+        } else {
+            profiles_ = builtin_impedance_profiles();
+            for (const auto& [_, profile] : profiles_) {
+                validate_impedance_profile(profile);
+            }
+            RCLCPP_WARN(get_logger(), "未找到阻抗档位文件，使用编译期内置档位");
+        }
+        active_profile_ = declare_parameter<std::string>("impedance_profile", "P0");
+        if (!profiles_.count(active_profile_)) {
+            throw std::runtime_error("未知阻抗档位: " + active_profile_);
+        }
+        external_gate_nm_ = declare_parameter<double>("external_torque_gate_nm", 0.8);
+        stale_hold_s_ = std::clamp(declare_parameter<double>("feedback_stale_hold_s", 0.5), 0.3, 1.0);
+        declare_parameter<bool>("test_force_feedback_stale", false);
+        param_callback_ = add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& parameters) {
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                for (const auto& parameter : parameters) {
+                    if (parameter.get_name() == "impedance_profile") {
+                        const auto name = parameter.as_string();
+                        const auto found = profiles_.find(name);
+                        if (found == profiles_.end()) {
+                            result.successful = false;
+                            result.reason = "未知阻抗档位: " + name;
+                            return result;
+                        }
+                        active_profile_ = name;
+                        if (!suppress_profile_apply_.load()) {
+                            for (auto& [_, arm] : arms_) {
+                                arm->set_profile(found->second);
+                            }
+                            RCLCPP_INFO(get_logger(), "阻抗档位 → %s（增益 %.2f s 斜坡）",
+                                        name.c_str(), found->second.gain_ramp_s);
+                        }
+                    } else if (parameter.get_name() == "external_torque_gate_nm") {
+                        const double gate = parameter.as_double();
+                        if (!(std::isfinite(gate) && gate >= 0.05 && gate <= 5.0)) {
+                            result.successful = false;
+                            result.reason = "external_torque_gate_nm 需在 0.05–5 Nm";
+                            return result;
+                        }
+                        external_gate_nm_ = gate;
+                        for (auto& [_, arm] : arms_) {
+                            arm->set_external_gate(gate);
+                        }
+                    } else if (parameter.get_name() == "test_force_feedback_stale") {
+                        for (auto& [_, arm] : arms_) {
+                            arm->set_force_feedback_stale(parameter.as_bool());
+                        }
+                    }
+                }
+                return result;
+            });
+
+        RCLCPP_INFO(get_logger(), "连接真机 CAN：左 %s，右 %s，阻抗档位 %s", left.c_str(),
+                    right.c_str(), active_profile_.c_str());
+        RCLCPP_INFO(get_logger(),
+                    "重力模型：urdf_scale=%.3f ee_left/right=%.4f/%.4f kg camera_left/right=%.3f/%.3f kg "
+                    "zero_g_gravity_gain=%.3f (+ hold integral)",
+                    model.urdf_scale,
+                    end_effector_mass_for(model, "left"), end_effector_mass_for(model, "right"),
+                    wrist_camera_mass_for(model, "left"), wrist_camera_mass_for(model, "right"),
+                    model.ff_gain);
+        const ImpedanceProfile& initial = profiles_.at(active_profile_);
+        auto left_tau = create_publisher<std_msgs::msg::Float64MultiArray>("tau_ext_left", 10);
+        auto right_tau = create_publisher<std_msgs::msg::Float64MultiArray>("tau_ext_right", 10);
+        arms_.emplace("left", std::make_unique<ArmBus>(left, "left", urdf, left_tune, model,
+                                                       logger, initial,
+                                                       external_gate_nm_, stale_hold_s_));
+        arms_.emplace("right", std::make_unique<ArmBus>(right, "right", urdf, right_tune, model,
+                                                        logger, initial,
+                                                        external_gate_nm_, stale_hold_s_));
+        arms_["left"]->set_tau_publisher(left_tau);
+        arms_["right"]->set_tau_publisher(right_tau);
+        if (profiles_.count("P-stop")) {
+            arms_["left"]->set_stop_profile(profiles_.at("P-stop"));
+            arms_["right"]->set_stop_profile(profiles_.at("P-stop"));
+        }
+        auto soft_stop = [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+            const auto found = profiles_.find("P-stop");
+            if (found == profiles_.end()) {
+                response->success = false;
+                response->message = "没有 P-stop 档位";
+                return;
+            }
+            const auto results = set_parameters(
+                {rclcpp::Parameter("impedance_profile", std::string("P-stop"))});
+            if (results.empty() || !results.front().successful) {
+                response->success = false;
+                response->message = results.empty() ? "参数设置失败" : results.front().reason;
+                return;
+            }
+            response->success = true;
+            response->message = "已进入软保持（J1–J4 kp=5），当前目标已取消，机械臂保持使能";
+        };
+        soft_stop_service_ = create_service<std_srvs::srv::Trigger>("~/soft_stop", soft_stop);
+        soft_stop_alias_service_ =
+            create_service<std_srvs::srv::Trigger>("/real_arm/soft_stop", soft_stop);
+        logger_ = logger;
+        if (arms_["left"]->has_gravity() && arms_["right"]->has_gravity()) {
+            RCLCPP_INFO(get_logger(),
+                        "已启用重力补偿+到位积分（消除静态误差；URDF=%s）", urdf.c_str());
+        } else {
+            RCLCPP_WARN(get_logger(), "重力补偿初始化失败，抬臂会明显下坠/偏软");
+        }
+        publisher_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+        // Separate callback groups so left/right FollowJointTrajectory can run in parallel
+        // under MultiThreadedExecutor (single-threaded spin would serialize them).
+        for (const auto& side : {"left", "right"}) {
+            action_groups_[side] =
+                create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+            servers_[side] = rclcpp_action::create_server<Follow>(
+                this, std::string(side) + "_arm_controller/follow_joint_trajectory",
+                std::bind(&RealArm::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&RealArm::handle_cancel, this, std::placeholders::_1),
+                std::bind(&RealArm::handle_execute, this, std::placeholders::_1),
+                rcl_action_server_get_default_options(), action_groups_[side]);
+        }
+        std::signal(SIGHUP, on_hup);
+        started_ = std::chrono::steady_clock::now();
+        running_ = true;
+        thread_ = std::thread([this] { loop(); });
+        RCLCPP_INFO(get_logger(), "真机已保持当前姿态，可以规划。精调后点窗口「根据日志精调重力」可热加载。");
+    }
+
+    ~RealArm() override {
+        running_ = false;
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (logger_) {
+            logger_->flush();
+        }
+    }
+
+private:
+    rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID&,
+                                            std::shared_ptr<const Follow::Goal> goal) {
+        if (goal->trajectory.points.empty()) {
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+        ArmBus* arm = arm_for(*goal);
+        if (arm == nullptr || arm->pose_hold_active()) {
+            if (arm != nullptr) {
+                RCLCPP_WARN(get_logger(), "软保持或手拖中，拒绝新轨迹。先切回 P0–P3");
+            }
+            return rclcpp_action::GoalResponse::REJECT;
+        }
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }
+
+    rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandle>) {
+        return rclcpp_action::CancelResponse::ACCEPT;
+    }
+
+    void handle_execute(const std::shared_ptr<GoalHandle> goal_handle) {
+        const auto goal = goal_handle->get_goal();
+        ArmBus* arm = arm_for(*goal);
+        if (arm == nullptr) {
+            goal_handle->abort(std::make_shared<Follow::Result>());
+            return;
+        }
+        std::vector<int> map(7, -1);
+        for (size_t index = 0; index < goal->trajectory.joint_names.size(); ++index) {
+            const auto& joint = goal->trajectory.joint_names[index];
+            const auto pos = joint.rfind("joint");
+            if (pos == std::string::npos || pos + 5 >= joint.size()) {
+                continue;
+            }
+            const int number = std::atoi(joint.c_str() + pos + 5);
+            if (number >= 1 && number <= 7) {
+                map[number - 1] = static_cast<int>(index);
+            }
+        }
+        for (int slot : map) {
+            if (slot < 0) {
+                RCLCPP_ERROR(get_logger(), "轨迹里缺少 7 个手臂关节");
+                goal_handle->abort(std::make_shared<Follow::Result>());
+                return;
+            }
+        }
+        Trajectory trajectory;
+        trajectory.active = true;
+        trajectory.virtual_time = 0.0;
+        const auto measured = arm->measured();
+        for (const auto& point : goal->trajectory.points) {
+            if (static_cast<int>(point.positions.size()) <=
+                *std::max_element(map.begin(), map.end())) {
+                goal_handle->abort(std::make_shared<Follow::Result>());
+                return;
+            }
+            std::array<double, 7> command{};
+            for (int joint = 0; joint < 7; ++joint) {
+                command[joint] = point.positions[map[joint]];
+            }
+            trajectory.times.push_back(std::max(0.0, seconds_of(point.time_from_start)));
+            trajectory.points.push_back(command);
+        }
+        double worst = 0.0;
+        for (int joint = 0; joint < 7; ++joint) {
+            worst = std::max(worst, std::abs(trajectory.points.front()[joint] - measured[joint]));
+        }
+        if (worst > kStartRejectError) {
+            RCLCPP_ERROR(get_logger(),
+                         "轨迹起点离当前关节 %.2f rad（>%.2f），拒绝。请用当前状态重新规划",
+                         worst, kStartRejectError);
+            arm->hold_here();
+            goal_handle->abort(std::make_shared<Follow::Result>());
+            return;
+        }
+        if (worst > kStartWarpError) {
+            // After a disturbance, MoveIt often plans from a stale "at goal" start.
+            // Warp the first knot to the real measured pose so execution can start.
+            RCLCPP_WARN(get_logger(),
+                        "轨迹起点偏差 %.2f rad，已把首点改成当前关节角再执行", worst);
+            trajectory.points.front() = measured;
+        }
+        const double duration = arm->set_trajectory(std::move(trajectory));
+        const uint64_t epoch = arm->motion_epoch();
+        // Extra time: stalls while the arm is held back by external force.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::duration<double>(arm->execution_timeout(duration));
+        bool finished = false;
+        while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+            if (arm->consume_stop(epoch) || goal_handle->is_canceling()) {
+                arm->clear_trajectory();
+                arm->hold_here();
+                goal_handle->canceled(std::make_shared<Follow::Result>());
+                return;
+            }
+            if (arm->trajectory_done()) {
+                finished = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        arm->clear_trajectory();
+        if (logger_) {
+            logger_->flush();
+        }
+        if (goal_handle->is_canceling()) {
+            arm->hold_here();
+            goal_handle->canceled(std::make_shared<Follow::Result>());
+            return;
+        }
+        const double final_err = arm->max_tracking_error();
+        if (!finished || final_err > arm->settle_error()) {
+            // Sync q_cmd to measured so the next plan's start state matches reality.
+            RCLCPP_ERROR(get_logger(),
+                         "跟踪未到位（误差 %.2f rad%s），已保持当前姿态。请松手后重新规划",
+                         final_err, finished ? "" : ", 执行超时");
+            arm->hold_here();
+            goal_handle->abort(std::make_shared<Follow::Result>());
+            return;
+        }
+        goal_handle->succeed(std::make_shared<Follow::Result>());
+    }
+
+    ArmBus* arm_for(const Follow::Goal& goal) {
+        bool left = false;
+        bool right = false;
+        for (const auto& joint : goal.trajectory.joint_names) {
+            left = left || joint.find("left") != std::string::npos;
+            right = right || joint.find("right") != std::string::npos;
+        }
+        if (left == right) {
+            RCLCPP_ERROR(get_logger(), "一条轨迹只能包含一只手臂");
+            return nullptr;
+        }
+        return arms_[left ? "left" : "right"].get();
+    }
+
+    void maybe_reload_gravity() {
+        bool force = g_reload_gravity.exchange(false);
+        if (!force && !gravity_yaml_.empty()) {
+            try {
+                const auto mtime = std::filesystem::last_write_time(gravity_yaml_);
+                if (mtime != yaml_mtime_) {
+                    yaml_mtime_ = mtime;
+                    force = true;
+                }
+            } catch (...) {
+            }
+        }
+        if (!force || gravity_yaml_.empty()) {
+            return;
+        }
+        GravityTune left_tune;
+        GravityTune right_tune;
+        GravityModel model;
+        if (!load_gravity_yaml_file(gravity_yaml_, &left_tune, &right_tune, &model)) {
+            RCLCPP_WARN(get_logger(), "热加载失败：读不了 %s", gravity_yaml_.c_str());
+            return;
+        }
+        arms_["left"]->set_tune(left_tune);
+        arms_["right"]->set_tune(right_tune);
+        arms_["left"]->set_model(model);
+        arms_["right"]->set_model(model);
+        RCLCPP_INFO(get_logger(),
+                    "已热加载重力：urdf_scale=%.3f ee_payload=%.4f zero_g_gravity_gain=%.3f",
+                    model.urdf_scale, model.ee_payload_kg, model.ff_gain);
+    }
+
+    void loop() {
+        auto next = std::chrono::steady_clock::now();
+        int reload_div = 0;
+        while (running_ && rclcpp::ok()) {
+            if ((++reload_div % 50) == 0) {  // ~2 Hz
+                maybe_reload_gravity();
+            }
+            const auto stamp = now();
+            const double t_sec =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+            sensor_msgs::msg::JointState message;
+            message.header.stamp = stamp;
+            bool feedback_failed = false;
+            for (auto& [_, arm] : arms_) {
+                arm->track(stamp);
+                if (!arm->spin_once(t_sec)) {
+                    feedback_failed = true;
+                    RCLCPP_ERROR(get_logger(), "真机反馈无效，已失能：%s", arm->fault_reason().c_str());
+                } else if (arm->entered_soft_hold() && active_profile_ != "P-stop") {
+                    // Gains were already snapped inside the arm. Don't apply the
+                    // profile again or the 0.2 s ramp starts over from P0.
+                    suppress_profile_apply_.store(true);
+                    set_parameters(
+                        {rclcpp::Parameter("impedance_profile", std::string("P-stop"))});
+                    suppress_profile_apply_.store(false);
+                }
+                arm->fill(&message);
+            }
+            if (feedback_failed) {
+                running_ = false;
+                break;
+            }
+            publisher_->publish(message);
+            next += std::chrono::milliseconds(10);
+            std::this_thread::sleep_until(next);
+        }
+    }
+
+    std::map<std::string, std::unique_ptr<ArmBus>> arms_;
+    std::map<std::string, rclcpp::CallbackGroup::SharedPtr> action_groups_;
+    std::map<std::string, rclcpp_action::Server<Follow>::SharedPtr> servers_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr publisher_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr soft_stop_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr soft_stop_alias_service_;
+    std::shared_ptr<ErrorLogger> logger_;
+    std::thread thread_;
+    std::chrono::steady_clock::time_point started_;
+    std::atomic<bool> running_{false};
+    std::string gravity_yaml_;
+    std::filesystem::file_time_type yaml_mtime_{};
+    std::unordered_map<std::string, ImpedanceProfile> profiles_;
+    std::string active_profile_ = "P0";
+    double external_gate_nm_ = 0.8;
+    double stale_hold_s_ = 0.5;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_;
+    std::atomic<bool> suppress_profile_apply_{false};
+};
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    try {
+        auto node = std::make_shared<RealArm>();
+        // At least two threads: left + right action execute callbacks can block together.
+        rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 4);
+        executor.add_node(node);
+        executor.spin();
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[openarm_real_arm] FATAL: %s\n", error.what());
+        RCLCPP_FATAL(rclcpp::get_logger("openarm_real_arm"), "真机连接失败：%s", error.what());
+        rclcpp::shutdown();
+        return 1;
+    }
+    rclcpp::shutdown();
+    return 0;
+}
