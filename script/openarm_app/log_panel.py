@@ -9,7 +9,7 @@ from pathlib import Path
 import os
 import re
 
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
@@ -62,11 +62,71 @@ class LogEntry:
 
 
 def classify(text: str) -> str:
-    for level, pattern in (("FATAL", r"\bFATAL\b"), ("ERROR", r"\bERROR\b|失败|错误"),
-                           ("WARN", r"\bWARN(?:ING)?\b|警告"), ("DEBUG", r"\bDEBUG\b")):
-        if re.search(pattern, text, re.IGNORECASE):
-            return level
-    return "INFO"
+    if re.search(r"\bFATAL\b", text, re.IGNORECASE):
+        level = "FATAL"
+    else:
+        warning = re.search(r"\bWARN(?:ING)?\b|警告", text, re.IGNORECASE)
+        # Progress lines carry a tracking field `error=0.01`. That is not a fault.
+        if re.search(r"\bERROR\b(?!\s*=)|失败", text, re.IGNORECASE) or ("错误" in text and not warning):
+            level = "ERROR"
+        elif warning:
+            level = "WARN"
+        elif re.search(r"\bDEBUG\b", text, re.IGNORECASE):
+            level = "DEBUG"
+        else:
+            level = "INFO"
+    return level
+
+
+class LogLineModel(QAbstractListModel):
+    """Visible log rows for the QML console. The widget view stays for existing checks."""
+
+    DisplayRole = Qt.ItemDataRole.UserRole + 1
+    LevelRole = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[LogEntry] = []
+
+    def roleNames(self):  # noqa: N802
+        return {
+            int(Qt.ItemDataRole.DisplayRole): b"displayText",
+            self.DisplayRole: b"display",
+            self.LevelRole: b"level",
+        }
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+        entry = self._rows[index.row()]
+        if role in (self.DisplayRole, Qt.ItemDataRole.DisplayRole):
+            return entry.display()
+        if role == self.LevelRole:
+            return entry.level
+        return None
+
+    def replace(self, entries) -> None:
+        self.beginResetModel()
+        self._rows = list(entries)
+        self.endResetModel()
+
+    def append(self, entries) -> None:
+        if not entries:
+            return
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(entries) - 1)
+        self._rows.extend(entries)
+        self.endInsertRows()
+        overflow = len(self._rows) - LogPanel.MAX_LINES
+        if overflow > 0:
+            self.beginRemoveRows(QModelIndex(), 0, overflow - 1)
+            del self._rows[:overflow]
+            self.endRemoveRows()
 
 
 class LogDialog(QDialog):
@@ -80,6 +140,7 @@ class LogDialog(QDialog):
 class LogPanel(QWidget):
     layout_changed = Signal()
     fatal_received = Signal(str)
+    countsChanged = Signal()
     MAX_LINES = 5000
 
     def __init__(self, parent=None, *, settings=None, archive_path: Path | None = None):
@@ -98,6 +159,7 @@ class LogPanel(QWidget):
         if self._archive:
             archive = self._archive
             self.destroyed.connect(lambda *_: archive.close())
+        self.lines = LogLineModel(self)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(4)
@@ -213,7 +275,7 @@ class LogPanel(QWidget):
         self.timer.start()
         self.shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         self.shortcut.activated.connect(self.open_find)
-        self.set_expanded(self.settings.value("log/expanded", True, type=bool))
+        self.set_expanded(self.settings.value("log/expanded", False, type=bool))
 
     def enqueue(self, text: str, source: str = "控制台", *, final=False):
         text = self.partials.pop(source, "") + ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
@@ -251,6 +313,7 @@ class LogPanel(QWidget):
         self.toggle.setStyleSheet("color: #ff6b6b;" if self.errors and not self.toggle.isChecked() else "")
         if self.pause.isChecked():
             self.new_button.setText(f"↓ 新日志 {len(self.pending) + self.dropped} 条")
+            self.countsChanged.emit()
             return
         if not self.pending:
             return
@@ -267,6 +330,7 @@ class LogPanel(QWidget):
         if not self._follow:
             self.unread += len(visible)
         self.new_button.setText(f"↓ 新日志 {self.unread} 条" if self.unread else "↓ 最新")
+        self.countsChanged.emit()
 
     def matches(self, entry):
         if not self.levels[entry.level].isChecked():
@@ -281,9 +345,11 @@ class LogPanel(QWidget):
                 return False
         return query.casefold() in entry.text.casefold()
 
-    def _insert(self, entries):
+    def _insert(self, entries, *, update_model=True):
         if not entries:
             return
+        if update_model:
+            self.lines.append(entries)
         bar = self.view.verticalScrollBar()
         old_value = bar.value()
         follow = self._follow and bar.value() >= bar.maximum() - 4
@@ -339,12 +405,15 @@ class LogPanel(QWidget):
                 error = f"正则表达式无效：{exc}"
         self.filter_error.setText(error)
         self.filter_error.setVisible(bool(error))
+        visible = [entry for entry in self.entries if self.matches(entry)]
+        self.lines.replace(visible)
         self._rendering = True
         self.view.clear()
         self._rendering = False
-        self._insert([entry for entry in self.entries if self.matches(entry)])
+        self._insert(visible, update_model=False)
         if self._follow:
             self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        self.countsChanged.emit()
 
     def clear(self):
         self.pending.clear()
@@ -353,6 +422,7 @@ class LogPanel(QWidget):
         self.warnings = self.errors = self.unread = self.dropped = 0
         self._seen_fatal.clear()
         self.fatal_banner.hide()
+        self.lines.replace([])
         self.view.clear()
         self._follow = True
         self.flush()

@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "script"))
 try:
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
-    from openarm_app.log_panel import IncrementalLogReader, LogPanel
+    from openarm_app.log_panel import IncrementalLogReader, LogPanel, classify
     from openarm_app.main_window import MainWindow
     QT_AVAILABLE = True
 except ImportError:
@@ -38,6 +38,17 @@ class LogReaderTests(unittest.TestCase):
             replacement.replace(path)
             self.assertEqual(reader.read(path), "rotated\n")
 
+    def test_clock_skew_warning_is_not_an_error(self):
+        line = "gmake[3]: 警告：检测到时钟错误。您的构建版本可能是不完整的。"
+        self.assertEqual(classify(line), "WARN")
+        self.assertEqual(classify("[ERROR] failed"), "ERROR")
+        self.assertEqual(classify("启动失败"), "ERROR")
+        self.assertEqual(
+            classify("[replay] PROGRESS time=1 duration=12 phase=playing error=0.01"),
+            "INFO",
+        )
+        self.assertEqual(classify("[replay][ERROR] alignment timed out"), "ERROR")
+
 
 @unittest.skipUnless(QT_AVAILABLE, "PySide6 required")
 class LogPanelTests(unittest.TestCase):
@@ -50,6 +61,7 @@ class LogPanelTests(unittest.TestCase):
         self.path = Path(self.directory.name)
         self.settings = QSettings(str(self.path / "settings.ini"), QSettings.Format.IniFormat)
         self.panel = LogPanel(settings=self.settings, archive_path=self.path / "complete.log")
+        self.panel.set_expanded(True)
         self.panel.resize(1100, 300)
         self.panel.show()
         self.app.processEvents()
@@ -196,25 +208,26 @@ class LogPanelTests(unittest.TestCase):
             with patch("openarm_app.main_window.local_ip", return_value="127.0.0.1"), \
                  patch("openarm_app.main_window.list_usb_cameras", return_value=[]), \
                  patch("openarm_app.main_window.QSettings", return_value=self.settings):
-                window = MainWindow()
-            window.resize(1100, 800)
-            window.show()
-            self.app.processEvents()
-            return window
+                return MainWindow()
 
         window = create_window()
-        height = window.log_splitter.height()
-        window.log_splitter.moveSplitter(height - 300, 1)
-        saved_height = window.log_splitter.sizes()[1]
+        self.assertFalse(window.logExpanded)
+        window.log_panel.enqueue("[FATAL] boom\n")
+        self.assertTrue(window.logExpanded)
+        self.assertIn("严重错误", window.status.text())
+        window.setLogExpanded(False)
+        window.setLogExpanded(True)
+        window.setLogHeight(300)
         window.close()
         window = create_window()
-        self.assertAlmostEqual(window.log_splitter.sizes()[1], saved_height, delta=5)
-        self.assertLessEqual(window.log_panel.height(), int(window.log_splitter.height() * .6))
-        window.log_panel.set_expanded(False)
-        self.app.processEvents()
-        self.assertEqual(window.log_panel.height(), 32)
+        self.assertTrue(window.logExpanded)
+        self.assertAlmostEqual(window.logHeight, 300, delta=5)
+        window.log_panel.enqueue("[FATAL] boom\n")
+        self.assertTrue(window.logExpanded)
+        self.assertIn("严重错误", window.status.text())
+        window.setLogExpanded(False)
         window.close()
         window = create_window()
+        self.assertFalse(window.logExpanded)
         self.assertFalse(window.log_panel.toggle.isChecked())
-        self.assertTrue(window.log_panel.body.isHidden())
         window.close()
