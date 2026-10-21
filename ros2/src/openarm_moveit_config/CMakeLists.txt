@@ -54,6 +54,7 @@ endif()
 ament_target_dependencies(real_arm rclcpp rclcpp_action control_msgs sensor_msgs std_msgs std_srvs)
 
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+install(FILES config/sensors_3d.yaml DESTINATION share/${PROJECT_NAME}/config)
 install(
   DIRECTORY ${OPENARM_ROOT}/models/OpenArm_V1/meshes
   DESTINATION share/${PROJECT_NAME}

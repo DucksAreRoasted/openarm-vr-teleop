@@ -104,8 +104,12 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT already shuts the context down. A second shutdown raises and
+        # makes this process exit 1, which the console treats as a crash.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

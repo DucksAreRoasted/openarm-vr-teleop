@@ -1,0 +1,9 @@
+# MoveIt starts an octomap monitor even with no depth camera. An empty or
+# missing sensor list is logged as an error. "~" tells the monitor to skip
+# this entry instead.
+sensors:
+  - disabled
+disabled:
+  sensor_plugin: "~"
+octomap_resolution: 0.05
+octomap_frame: world
