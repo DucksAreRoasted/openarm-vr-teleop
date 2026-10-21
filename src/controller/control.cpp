@@ -180,6 +180,7 @@ Control::Control(std::shared_ptr<TeleopHardware> hardware, Dynamics* dynamics_l,
     openarmgripperjointconverter_ = new OpenArmJointConverter(hand_motor_num_);
 
     arm_type_ = arm_type;
+    joint_angle_stream_ = JointAngleStream::create(arm_type_);
 }
 
 Control::Control(openarm::can::socket::OpenArm* arm, Dynamics* dynamics_l, Dynamics* dynamics_f,
@@ -441,6 +442,7 @@ bool Control::bilateral_step() {
     // set reponse
     robot_state_->arm_state().set_all_responses(joint_arm_states);
     robot_state_->hand_state().set_all_responses(joint_gripper_states);
+    if (joint_angle_stream_) joint_angle_stream_->update(joint_arm_states);
 
     size_t arm_dof = robot_state_->arm_state().get_size();
     size_t gripper_dof = robot_state_->hand_state().get_size();
@@ -641,6 +643,7 @@ bool Control::unilateral_step() {
     // set reponse
     robot_state_->arm_state().set_all_responses(joint_arm_states);
     robot_state_->hand_state().set_all_responses(joint_gripper_states);
+    if (joint_angle_stream_) joint_angle_stream_->update(joint_arm_states);
 
     size_t arm_dof = robot_state_->arm_state().get_size();
     size_t gripper_dof = robot_state_->hand_state().get_size();

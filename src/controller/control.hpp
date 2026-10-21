@@ -19,6 +19,7 @@
 #include <controller/dynamics.hpp>
 #include <controller/gravity_comp.hpp>
 #include <io/control_diagnostics.hpp>
+#include <io/joint_angle_stream.hpp>
 #include <atomic>
 #include <deque>
 #include <fstream>
@@ -37,6 +38,7 @@
 
 class Control {
     std::shared_ptr<TeleopHardware> hardware_;
+    std::unique_ptr<JointAngleStream> joint_angle_stream_;
 
     double Ts_;
     int role_;
