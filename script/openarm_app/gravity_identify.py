@@ -38,3 +38,33 @@ def run_identification(log_path: Path, yaml_path: Path, write: bool) -> tuple[bo
 def summary(output: str) -> str:
     return "\n".join(line.strip() for line in output.splitlines()
                      if line.strip().startswith(_SUMMARY_MARKERS))
+
+
+FRICTION_SCRIPT = ROOT / "scripts" / "identify_friction.py"
+
+
+def friction_collect_command(yaml_path: Path, *, gripper: bool = False) -> list[str]:
+    """Move the arms or the grippers, then preview the fit without writing."""
+    command = [sys.executable, "-u", str(FRICTION_SCRIPT), "--collect", "--dry-run", "--write", str(yaml_path)]
+    if gripper:
+        command.append("--gripper")
+    return command
+
+
+def run_friction_write(log_path: Path, yaml_path: Path) -> tuple[bool, str]:
+    command = [sys.executable, str(FRICTION_SCRIPT), str(log_path), "--write", str(yaml_path)]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120, check=False)
+    output = (result.stdout + result.stderr).strip()
+    return result.returncode == 0, output or f"摩擦辨识退出码 {result.returncode}"
+
+
+def friction_log_path(output: str) -> Path | None:
+    for line in reversed(output.splitlines()):
+        if line.startswith("FRICTION_LOG_PATH="):
+            return Path(line.split("=", 1)[1].strip())
+    return None
+
+
+def friction_summary(output: str) -> str:
+    return "\n".join(line.strip() for line in output.splitlines()
+                     if line.strip().startswith(("[left]", "[right]", "[warn] 没有", "夹爪写入")))
