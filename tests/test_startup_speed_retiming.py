@@ -56,13 +56,15 @@ int main(int argc, char** argv) {
         for (size_t j=0;j<16;++j) assert(std::abs(sample->at(j).velocity)<=limits[j]+1e-9);
     }
     assert(replay_feedback_speed_limit(6)==3); // hard stop is retained
-    assert(peak(original,.01)>3); // reproduce the observed startup overshoot
+    // The startup file is the left recording mirrored onto the right, so the
+    // old right-wrist burst above 3 rad/s is gone.
+    assert(peak(original,.01)<3);
     for (double inertia : {.003,.006,.01,.03}) {
         const double before=peak(original,inertia), after=peak(retimed,inertia);
         std::cout << "inertia=" << inertia << " original_peak=" << before
                   << " retimed_peak=" << after << std::endl;
         assert(after<3);
-        assert(after<before);
+        assert(after<=before+1e-9);
     }
     // Nonpositive limits are rejected rather than disabling protection.
     bool rejected=false;
@@ -78,3 +80,17 @@ int main(int argc, char** argv) {
                             str(source), str(ROOT/'src/io/teleop_io.cpp'), '-o', str(binary)], check=True)
             subprocess.run([str(binary), str(startup)], check=True)
             self.assertEqual(hashlib.sha256(startup.read_bytes()).digest(), digest)
+
+    def test_startup_right_arm_mirrors_left(self):
+        # j3 flips with the shoulders and wrist. Leaving it unchanged swings
+        # both forearms to the same side.
+        sign = [-1, -1, -1, 1, -1, -1, -1, 1]
+        lines = (ROOT / "assets/steady_action_on_table.csv").read_text().splitlines()
+        self.assertTrue(lines[0].startswith("time,"))
+        for line in lines[1:]:
+            cells = line.split(",")
+            for joint, factor in enumerate(sign):
+                for offset in range(3):
+                    left = float(cells[1 + joint * 3 + offset])
+                    right = float(cells[1 + (8 + joint) * 3 + offset])
+                    self.assertAlmostEqual(right, factor * left, places=6)
