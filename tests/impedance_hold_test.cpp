@@ -60,8 +60,11 @@ int main(int argc, char** argv) {
     GravityModel model;
     model.ff_gain = 0.95;
     model.tracking_ff_gain = 1.2;  // independent tracking setting must not enter gravity term
+    tune.fc[5] = 0.4;
+    tune.fv[5] = 0.2;
+    tune.fk[5] = 8;
     assert(compose_gravity_torque(0.8, tune, 5, model.ff_gain) ==
-           compose_tau_ff(0.8, tune, 5, 0, model.ff_gain));
+           compose_tau_ff(0.8, tune, 5, 0.3, model.ff_gain));
 
     for (const auto* name : {"P2", "P3"}) {
         const auto& p = profiles.at(name);

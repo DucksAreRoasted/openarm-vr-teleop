@@ -3996,6 +3996,9 @@ int main(int argc, char** argv) {
                     bundle->control->SetFollowerGravity(gravity_dynamics, tune, gravity_gain,
                                                         gravity_ramp);
                 }
+                bundle->control->SetGripperFriction(gravity_model.gripper_friction_fc,
+                                                    gravity_model.gripper_friction_fv,
+                                                    gravity_model.gripper_friction_k);
                 if (!options.sim && bundle->openarm != nullptr) {
                     bundle->control->BindCanBus(bundle->openarm);
                 }

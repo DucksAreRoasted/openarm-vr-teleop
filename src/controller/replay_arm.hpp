@@ -128,6 +128,8 @@ private:
                 env_double_or_common("OPENARM_QUEST_GRAVITY_GAIN", model_.tracking_ff_gain),
                 env_double_or_common("OPENARM_QUEST_GRAVITY_RAMP_SEC", 1.0));
         }
+        control_->SetGripperFriction(model_.gripper_friction_fc, model_.gripper_friction_fv,
+                                     model_.gripper_friction_k);
         control_->BindCanBus(can_.get());
         if (!control_->SeedHoldMeasured()) throw std::runtime_error("replay: failed to seed follower hold");
     }

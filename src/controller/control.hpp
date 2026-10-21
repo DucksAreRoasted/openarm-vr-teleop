@@ -92,6 +92,9 @@ class Control {
     double gripper_slip_boost_timer_ = 0.0;
     double gripper_last_raw_target_ = 0.0;
     double gripper_close_sign_ = 0.0;
+    double gripper_friction_fc_ = 0.08;
+    double gripper_friction_fv_ = 0.005;
+    double gripper_friction_k_ = 25.0;
 
 public:
     Control(std::shared_ptr<TeleopHardware> hardware, Dynamics *dynamics_l, Dynamics *dynamics_f,
@@ -125,6 +128,8 @@ public:
     // Configure before starting the control thread. Uses measured q, gravity only.
     void SetFollowerGravity(std::shared_ptr<Dynamics> dynamics, const GravityTune& tune,
                             double gain, double ramp_sec = 1.0);
+    // Coulomb/viscous feedforward for the gripper motor. Defaults match gravity_comp.yaml.
+    void SetGripperFriction(double fc, double fv, double k);
     // Real CAN bus used for feedback age / error_code checks. Simulation leaves this unset.
     void BindCanBus(openarm::can::socket::OpenArm* bus);
     // Set on the control thread; phase 0=teleop, 1=alignment, 2=play, 3=hold.
@@ -168,6 +173,7 @@ private:
     bool feedback_blocks_output();
     bool apply_follower_gravity(const std::vector<JointState>& measured,
                                 std::vector<JointState>* reference, double dt);
+    double gripper_friction_ff(double velocity) const;
     void latch_output_disabled(const std::string& reason);
     void send_zero_gain_frame(const std::vector<JointState>& joints);
     bool latch_safety_stop(const SafetyStatus& status, const std::vector<JointState>& safe_ref);

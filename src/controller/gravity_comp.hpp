@@ -1,4 +1,4 @@
-// Shared gravity + friction feedforward.
+// Shared gravity feedforward. Identified friction stays in the tune and is not added.
 // Aligned with OpenArmX gravity_comp: τ_ff = g_scale * G(q), then clamp.
 // Ref: https://github.com/hzhxxxxx/Xc-openarm/.../openarmx_gravity_comp/README_CN.md
 #pragma once
@@ -98,6 +98,7 @@ inline const std::array<double, 21>& link_com_deltas_for(const GravityModel& mod
 // OpenArmX TAU_LIMITS (Nm): proximal RS04-class, mid RS03, wrist RS00.
 inline constexpr std::array<double, 7> kTauFfLimits{20.0, 20.0, 7.0, 7.0, 2.0, 2.0, 2.0};
 
+// Coulomb + viscous model written by friction identification. Not applied as feedforward.
 inline double friction_torque(double dq, double fc, double fv, double fk) {
     const double k = std::max(1.0, fk);
     return fc * std::tanh(k * dq) + fv * dq;
@@ -108,10 +109,9 @@ inline double compose_gravity_torque(double g, const GravityTune& tune, size_t j
     return ff_gain * (tune.scale[joint] * g + tune.bias[joint]);
 }
 
-inline double compose_tau_ff(double g, const GravityTune& tune, size_t joint, double dq,
+inline double compose_tau_ff(double g, const GravityTune& tune, size_t joint, double /*dq*/,
                              double ff_gain = 1.0) {
-    const double grav = compose_gravity_torque(g, tune, joint, ff_gain);
-    double tau = grav + friction_torque(dq, tune.fc[joint], tune.fv[joint], tune.fk[joint]);
+    const double tau = compose_gravity_torque(g, tune, joint, ff_gain);
     const double lim = (joint < kTauFfLimits.size()) ? kTauFfLimits[joint] : 20.0;
     return std::clamp(tau, -lim, lim);
 }
