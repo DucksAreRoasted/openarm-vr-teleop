@@ -10,7 +10,7 @@ import signal
 import sys
 import tempfile
 
-from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtCore import Property, QObject, QProcess, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .services import ROOT
-from .theme import fit_window
+from .theme import APP_STYLE, fit_window
 
 # 控制端日后可能在进度行追加 loop=<n> loops=<总数或 inf>；字段缺失时回退到界面状态。
 _PHASE_LABELS = {
@@ -57,8 +57,11 @@ class TrajectoryPath(QLineEdit):
 
 
 class ReplayDialog(QDialog):
+    uiChanged = Signal()
+
     def __init__(self, parent=None, *, source: str = "", left_can: str = "can1", right_can: str = "can0") -> None:
         super().__init__(parent)
+        self.setStyleSheet(APP_STYLE)
         self.setWindowTitle("动作回放")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.left_can, self.right_can = left_can, right_can
@@ -136,7 +139,7 @@ class ReplayDialog(QDialog):
         self.repeat.valueChanged.connect(self._repeat_changed)
         repeats.addWidget(self.forever)
         options.addRow("播放次数", repeats)
-        playback_hint = QLabel("先点击“到达起手位置”，双臂完整执行你的起手轨迹，再平滑衔接录制首帧并保持；到位后点击“开始回放”。全部播完保持末帧，可返回录制首帧后再次开始。设置多遍时，每遍之间自动循环。仿真预览不验证真机跟踪或返回路径。")
+        playback_hint = QLabel("先点击“到达起手位置”，双臂沿镜像起手轨迹走到起手末帧并保持。点击“开始回放”后才衔接到这条录像的第一帧；录像左右不对称时，末端会在开播后分开。全部播完保持末帧，可返回录制首帧后再次开始。设置多遍时，每遍之间自动循环。仿真预览不验证真机跟踪或返回路径。")
         playback_hint.setWordWrap(True)
         playback_hint.setObjectName("Hint")
         options.addRow(playback_hint)
@@ -178,8 +181,8 @@ class ReplayDialog(QDialog):
         self.log.setVisible(False)
         self.log_toggle.toggled.connect(self.log.setVisible)
         layout.addWidget(self.log, 1)
-        self.prepare.setToolTip("检查文件后，完整执行 Quest 起手轨迹，再平滑衔接录制首帧并保持，等待手动开始。播完后直接平滑返回录制首帧，不重复起手轨迹；修改动作或设置需先停止并释放。")
-        self.start.setToolTip("机械臂到达起手位置后，点击此按钮才按所设速度和次数回放动作。")
+        self.prepare.setToolTip("检查文件后，完整执行镜像起手轨迹并停在起手末帧，等待手动开始。点击开始回放后才衔接到录像第一帧。播完后直接平滑返回录制首帧，不重复起手轨迹；修改动作或设置需先停止并释放。")
+        self.start.setToolTip("从镜像起手末帧衔接到录像第一帧，再按所设速度和次数回放。")
         self.pause.setToolTip("暂停轨迹时间，双臂继续保持当前位置附近；继续后从暂停位置播放。")
         self.finish_loop.setToolTip("播完当前这一遍后结束循环并保持末帧；暂停时需先继续。")
         self.stop.setToolTip("停止编译或回放；控制器退出并失能双臂，请先托住机械臂。")
@@ -222,9 +225,11 @@ class ReplayDialog(QDialog):
         self.progress.setEnabled(running and self._playing and self.mode.currentIndex() == 0
                                  and self._duration > 0 and not self._stopping and not self._aligning
                                  and not self._ready and self._pending_action is None)
+        self.uiChanged.emit()
 
     def _scrub_preview(self, value: int) -> None:
         self.progress_time.setText(f"定位到 {self._duration * value / 1000:.1f} / {self._duration:.1f} 秒")
+        self.uiChanged.emit()
 
     def _seek(self, *_args) -> None:
         if not self._running() or not self.progress.isEnabled() or self.mode.currentIndex() != 0:
@@ -233,7 +238,7 @@ class ReplayDialog(QDialog):
         self.process.write(f"seek {target:.9f}\n".encode())
 
     def _choose_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择动作片段目录", str(ROOT / "recordings/sessions"))
+        path = QFileDialog.getExistingDirectory(None, "选择动作片段目录", str(ROOT / "recordings/sessions"))
         if path: self.source.setText(path)
 
     def _source_changed(self, text: str) -> None:
@@ -247,7 +252,7 @@ class ReplayDialog(QDialog):
             pass
 
     def _choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择双臂轨迹", str(ROOT / "recordings/sessions"), "轨迹 (*.csv)")
+        path, _ = QFileDialog.getOpenFileName(None, "选择双臂轨迹", str(ROOT / "recordings/sessions"), "轨迹 (*.csv)")
         if path: self.source.setText(path)
 
     def _start(self) -> None:
@@ -332,6 +337,7 @@ class ReplayDialog(QDialog):
 
     def _append_log(self, line: str) -> None:
         self.log.appendPlainText(line)
+        self.uiChanged.emit()
         if self._log_path is not None:
             try:
                 with self._log_path.open("a", encoding="utf-8") as handle:
@@ -354,7 +360,12 @@ class ReplayDialog(QDialog):
                 self._aligning = True
                 cycle = re.search(r"cycle=(\d+)", line)
                 if cycle: self._cycle = int(cycle[1])
-                self.status.setText("正在沿起手轨迹准备并衔接首帧…")
+                if "from startup pose" in line:
+                    self.status.setText("正在从起手位置衔接到录像第一帧…")
+                elif "return" in line or "cycle=" in line:
+                    self.status.setText("正在返回录制首帧…")
+                else:
+                    self.status.setText("正在沿起手轨迹走到镜像起手位置…")
             if "[replay] PLAYING" in line:
                 self._pending_action = None
                 self._ready = False
@@ -426,6 +437,7 @@ class ReplayDialog(QDialog):
         self._paused = not self._paused
         self.process.write(b"pause\n" if self._paused else b"resume\n")
         self.pause.setText("继续" if self._paused else "暂停")
+        self.uiChanged.emit()
 
     def _stop(self) -> None:
         if not self._running(): return
@@ -482,3 +494,198 @@ class ReplayDialog(QDialog):
             event.ignore(); self.reject()
         else:
             event.accept()
+
+
+class ReplayBridge(QObject):
+    """Hidden replay session shown by the QML page instead of a modal dialog."""
+
+    changed = Signal()
+
+    def __init__(self, console) -> None:
+        super().__init__(console)
+        self.dialog = ReplayDialog(
+            None,
+            left_can=console._left_can.strip(),
+            right_can=console._right_can.strip(),
+        )
+        self.dialog.uiChanged.connect(self.changed.emit)
+
+    def load(self, source: str, left: str, right: str) -> None:
+        dialog = self.dialog
+        dialog.left_can = left
+        dialog.right_can = right
+        dialog.safety.setText(f"真机确认：CAN 已配置（左 {left}、右 {right}），工作区清空，急停可用")
+        if source:
+            dialog.source.setText(source)
+        self.changed.emit()
+
+    @Property(str, notify=changed)
+    def source(self) -> str:
+        return self.dialog.source.text()
+
+    @Property(int, notify=changed)
+    def modeIndex(self) -> int:
+        return self.dialog.mode.currentIndex()
+
+    @Property(int, notify=changed)
+    def speedIndex(self) -> int:
+        return self.dialog.speed.currentIndex()
+
+    @Property(int, notify=changed)
+    def unitsIndex(self) -> int:
+        return self.dialog.units.currentIndex()
+
+    @Property(int, notify=changed)
+    def repeatCount(self) -> int:
+        return self.dialog.repeat.value()
+
+    @Property(bool, notify=changed)
+    def forever(self) -> bool:
+        return self.dialog.forever.isChecked()
+
+    @Property(bool, notify=changed)
+    def safetyChecked(self) -> bool:
+        return self.dialog.safety.isChecked()
+
+    @Property(str, notify=changed)
+    def safetyLabel(self) -> str:
+        return self.dialog.safety.text()
+
+    @Property(str, notify=changed)
+    def statusText(self) -> str:
+        return self.dialog.status.text()
+
+    @Property(int, notify=changed)
+    def progress(self) -> int:
+        return self.dialog.progress.value()
+
+    @Property(str, notify=changed)
+    def progressText(self) -> str:
+        return self.dialog.progress_time.text()
+
+    @Property(str, notify=changed)
+    def logText(self) -> str:
+        return self.dialog.log.toPlainText()
+
+    @Property(bool, notify=changed)
+    def running(self) -> bool:
+        return self.dialog._running()
+
+    @Property(bool, notify=changed)
+    def canEditSetup(self) -> bool:
+        return self.dialog.source.isEnabled()
+
+    @Property(bool, notify=changed)
+    def canEditRepeat(self) -> bool:
+        return self.dialog.repeat.isEnabled()
+
+    @Property(str, notify=changed)
+    def prepareLabel(self) -> str:
+        return self.dialog.prepare.text()
+
+    @Property(bool, notify=changed)
+    def canPrepare(self) -> bool:
+        return self.dialog.prepare.isEnabled()
+
+    @Property(bool, notify=changed)
+    def canStart(self) -> bool:
+        return self.dialog.start.isEnabled()
+
+    @Property(bool, notify=changed)
+    def canPause(self) -> bool:
+        return self.dialog.pause.isEnabled()
+
+    @Property(str, notify=changed)
+    def pauseLabel(self) -> str:
+        return self.dialog.pause.text()
+
+    @Property(bool, notify=changed)
+    def canFinish(self) -> bool:
+        return self.dialog.finish_loop.isEnabled()
+
+    @Property(bool, notify=changed)
+    def canStop(self) -> bool:
+        return self.dialog.stop.isEnabled()
+
+    @Property(bool, notify=changed)
+    def canSeek(self) -> bool:
+        return self.dialog.progress.isEnabled()
+
+    @Slot(str)
+    def setSource(self, value: str) -> None:
+        if value != self.dialog.source.text():
+            self.dialog.source.setText(value)
+            self.changed.emit()
+
+    @Slot(int)
+    def setModeIndex(self, index: int) -> None:
+        if index != self.dialog.mode.currentIndex():
+            self.dialog.mode.setCurrentIndex(index)
+
+    @Slot(int)
+    def setSpeedIndex(self, index: int) -> None:
+        if index != self.dialog.speed.currentIndex():
+            self.dialog.speed.setCurrentIndex(index)
+            self.changed.emit()
+
+    @Slot(int)
+    def setUnitsIndex(self, index: int) -> None:
+        if index != self.dialog.units.currentIndex():
+            self.dialog.units.setCurrentIndex(index)
+            self.changed.emit()
+
+    @Slot(int)
+    def setRepeatCount(self, value: int) -> None:
+        if value != self.dialog.repeat.value():
+            self.dialog.repeat.setValue(value)
+            self.changed.emit()
+
+    @Slot(bool)
+    def setForever(self, checked: bool) -> None:
+        if checked != self.dialog.forever.isChecked():
+            self.dialog.forever.setChecked(checked)
+            self.changed.emit()
+
+    @Slot(bool)
+    def setSafetyChecked(self, checked: bool) -> None:
+        if checked != self.dialog.safety.isChecked():
+            self.dialog.safety.setChecked(checked)
+
+    @Slot()
+    def chooseFolder(self) -> None:
+        self.dialog._choose_folder()
+        self.changed.emit()
+
+    @Slot()
+    def chooseFile(self) -> None:
+        self.dialog._choose_file()
+        self.changed.emit()
+
+    @Slot()
+    def prepare(self) -> None:
+        self.dialog._prepare()
+
+    @Slot()
+    def startPlayback(self) -> None:
+        self.dialog._start()
+
+    @Slot()
+    def pausePlayback(self) -> None:
+        self.dialog._pause()
+
+    @Slot()
+    def finishLoop(self) -> None:
+        self.dialog._finish_loop()
+
+    @Slot()
+    def stopPlayback(self) -> None:
+        self.dialog._stop()
+
+    @Slot(float)
+    def previewSeek(self, value: float) -> None:
+        self.dialog._scrub_preview(int(value))
+
+    @Slot(float)
+    def seekTo(self, value: float) -> None:
+        self.dialog.progress.setSliderPosition(int(value))
+        self.dialog._seek()

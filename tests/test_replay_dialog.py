@@ -89,23 +89,14 @@ class ReplayDialogTests(unittest.TestCase):
         self.assertEqual(window.quest_profile.currentData(), "unitree_style")
         self.assertEqual([window.quest_profile.itemData(i)
                           for i in range(window.quest_profile.count())],
-                         ["unitree_style", "pika_style"])
+                         ["unitree_style"])
         with tempfile.TemporaryDirectory() as directory:
-            for profile in ("unitree_style", "pika_style"):
-                with self.subTest(profile=profile):
-                    window.quest_profile.setCurrentIndex(window.quest_profile.findData(profile))
-                    window._quest_profile_requested = window.quest_profile.currentData()
-                    window.log_path = Path(directory) / "control.log"
-                    with patch("openarm_app.main_window.subprocess.Popen") as spawn:
-                        window._spawn("sim", "can1", "can0")
-                        self.assertEqual(spawn.call_args.kwargs["env"]["VR_TELEOP_MODE"], profile)
-                    with patch.object(window, "_running", return_value=True):
-                        window._apply_record_state()
-                        self.assertFalse(window.quest_profile.isEnabled())
-                    window.proc = None
-                    window._close_log()
-                    window._apply_record_state()
-                    self.assertTrue(window.quest_profile.isEnabled())
+            window._quest_profile_requested = "pika_style"
+            window.log_path = Path(directory) / "control.log"
+            with patch("openarm_app.main_window.subprocess.Popen") as spawn:
+                window._spawn("sim", "can1", "can0")
+                self.assertEqual(spawn.call_args.kwargs["env"]["VR_TELEOP_MODE"], "unitree_style")
+            window._close_log()
         window.close()
 
     def test_recording_metadata_selects_source_gripper_units(self):

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <vector>
@@ -249,6 +250,141 @@ inline double unit_smooth(double s) {
 inline double unit_smooth_dot(double s) {
     s = std::clamp(s, 0.0, 1.0);
     return 30.0 * s * s * (s * (s - 2.0) + 1.0);
+}
+
+// MoveIt knot times stay put. A clamped cubic spline passes through every knot,
+// keeps start/end velocity at 0, and leaves interior knot velocity continuous
+// (C2). Per-segment smootherstep zeroed velocity at every knot.
+struct DenseJointPath {
+    std::vector<double> times;
+    std::vector<std::array<double, 7>> points;
+    std::vector<std::array<double, 7>> velocities;
+};
+
+inline std::vector<double> monotonic_knot_times(const std::vector<double>& times) {
+    std::vector<double> out = times;
+    for (size_t index = 1; index < out.size(); ++index) {
+        if (!(out[index] > out[index - 1] + 1e-6)) {
+            out[index] = out[index - 1] + 1e-4;
+        }
+    }
+    return out;
+}
+
+// Interior slopes of a cubic spline with s_0 = s_{n-1} = 0.
+inline std::vector<double> clamped_cubic_slopes(const std::vector<double>& times,
+                                                const std::vector<double>& values) {
+    const size_t count = times.size();
+    std::vector<double> slope(count, 0.0);
+    if (count < 3 || values.size() != count) {
+        return slope;
+    }
+
+    std::vector<double> span(count - 1);
+    for (size_t index = 0; index + 1 < count; ++index) {
+        span[index] = std::max(times[index + 1] - times[index], 1e-6);
+    }
+
+    const size_t unknown = count - 2;
+    std::vector<double> lower(unknown), diag(unknown), upper(unknown), rhs(unknown);
+    for (size_t row = 0; row < unknown; ++row) {
+        const size_t knot = row + 1;
+        const double span_prev = span[knot - 1];
+        const double span_next = span[knot];
+        lower[row] = span_next;
+        diag[row] = 2.0 * (span_prev + span_next);
+        upper[row] = (row + 1 == unknown) ? 0.0 : span_prev;
+        const double rise_prev = (values[knot] - values[knot - 1]) / span_prev;
+        const double rise_next = (values[knot + 1] - values[knot]) / span_next;
+        rhs[row] = 3.0 * (span_prev * rise_next + span_next * rise_prev);
+    }
+
+    upper[0] /= diag[0];
+    rhs[0] /= diag[0];
+    for (size_t row = 1; row < unknown; ++row) {
+        const double weight = diag[row] - lower[row] * upper[row - 1];
+        const double denom = std::abs(weight) > 1e-12 ? weight : std::copysign(1e-12, weight);
+        upper[row] /= denom;
+        rhs[row] = (rhs[row] - lower[row] * rhs[row - 1]) / denom;
+    }
+
+    slope[unknown] = rhs[unknown - 1];
+    for (size_t row = unknown - 1; row-- > 0;) {
+        slope[row + 1] = rhs[row] - upper[row] * slope[row + 2];
+    }
+    return slope;
+}
+
+inline void cubic_hermite(double y0, double y1, double slope0, double slope1, double span,
+                          double mix, double* position, double* velocity) {
+    const double mix2 = mix * mix;
+    const double mix3 = mix2 * mix;
+    const double h00 = 2.0 * mix3 - 3.0 * mix2 + 1.0;
+    const double h10 = mix3 - 2.0 * mix2 + mix;
+    const double h01 = -2.0 * mix3 + 3.0 * mix2;
+    const double h11 = mix3 - mix2;
+    *position = h00 * y0 + h10 * span * slope0 + h01 * y1 + h11 * span * slope1;
+
+    const double d00 = 6.0 * mix2 - 6.0 * mix;
+    const double d10 = 3.0 * mix2 - 4.0 * mix + 1.0;
+    const double d01 = -6.0 * mix2 + 6.0 * mix;
+    const double d11 = 3.0 * mix2 - 2.0 * mix;
+    const double span_safe = std::max(span, 1e-6);
+    *velocity = (d00 * y0 + d10 * span_safe * slope0 + d01 * y1 + d11 * span_safe * slope1) /
+                span_safe;
+}
+
+inline DenseJointPath densify_clamped_cubic(const std::vector<double>& times,
+                                            const std::vector<std::array<double, 7>>& points,
+                                            double sample_dt) {
+    DenseJointPath out;
+    if (points.size() < 2 || times.size() != points.size()) {
+        out.times = times;
+        out.points = points;
+        return out;
+    }
+
+    const std::vector<double> knots = monotonic_knot_times(times);
+    sample_dt = std::clamp(sample_dt, 0.002, 0.05);
+
+    std::array<std::vector<double>, 7> slopes;
+    for (size_t joint = 0; joint < slopes.size(); ++joint) {
+        std::vector<double> values(points.size());
+        for (size_t index = 0; index < points.size(); ++index) {
+            values[index] = points[index][joint];
+        }
+        slopes[joint] = clamped_cubic_slopes(knots, values);
+    }
+
+    out.times.push_back(knots.front());
+    out.points.push_back(points.front());
+    out.velocities.push_back({});
+
+    for (size_t segment = 0; segment + 1 < knots.size(); ++segment) {
+        const double t0 = knots[segment];
+        const double span = knots[segment + 1] - t0;
+        const int steps = std::max(1, static_cast<int>(std::ceil(span / sample_dt)));
+        for (int step = 1; step <= steps; ++step) {
+            const double mix = static_cast<double>(step) / static_cast<double>(steps);
+            std::array<double, 7> position{};
+            std::array<double, 7> velocity{};
+            for (size_t joint = 0; joint < position.size(); ++joint) {
+                cubic_hermite(points[segment][joint], points[segment + 1][joint],
+                              slopes[joint][segment], slopes[joint][segment + 1], span, mix,
+                              &position[joint], &velocity[joint]);
+            }
+            out.times.push_back(t0 + mix * span);
+            out.points.push_back(position);
+            out.velocities.push_back(velocity);
+        }
+    }
+
+    if (!out.points.empty()) {
+        out.points.back() = points.back();
+        out.times.back() = knots.back();
+        out.velocities.back().fill(0.0);
+    }
+    return out;
 }
 
 }  // namespace scurve

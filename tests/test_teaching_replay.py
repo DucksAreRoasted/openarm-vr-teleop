@@ -33,11 +33,23 @@ int main(int argc,char** argv) {
         assert(trajectory.sample(1).position[0]>=lo[0]);
         assert(trajectory.sample(1).position[0]<=hi[0]);
         for(bool lower:{false,true}) {
-            trajectory.load(argv[1]);lo[0]=lower ? 2e-6 : -2;hi[0]=lower ? 2 : .2-2e-6;
+            trajectory.load(argv[1]);lo[0]=lower ? .02 : -2;hi[0]=lower ? 2 : .2-.02;
             bool rejected=false;
             try {trajectory.validate_limits(lo,hi);} catch(const std::exception&) {rejected=true;}
             assert(rejected);
         }
+        return 0;
+    }
+    if(argc>2 && std::string(argv[2])=="gripper") {
+        trajectory.load(argv[1]);
+        assert(trajectory.convert_grippers(false, false) == 4);
+        assert(std::abs(trajectory.sample(0).position[7] + .98) < 1e-9);
+        assert(std::abs(trajectory.sample(0).position[15] - .62) < 1e-9);
+        TeachingTrajectory wild;
+        wild.load(argv[3]);
+        bool rejected = false;
+        try { wild.convert_grippers(false, false); } catch (const std::exception&) { rejected = true; }
+        assert(rejected);
         return 0;
     }
     if(argc>2) {
@@ -48,7 +60,7 @@ int main(int argc,char** argv) {
     assert(trajectory.size()==2 && trajectory.duration()==2);
     auto middle=trajectory.sample(1);
     assert(std::abs(middle.position[0]-.1)<1e-9);
-    assert(std::abs(middle.velocity[0]-.1)<1e-9); // recorded dq=999 is ignored
+    assert(std::abs(middle.velocity[0]-.15)<1e-9); // cubic, end slopes 0; recorded dq=999 is ignored
     assert(trajectory.sample(2).velocity[0]==0);
     trajectory.convert_grippers(false,true);
     assert(std::abs(trajectory.sample(0).position[7]-(.18/1.6*.044))<1e-9);
@@ -95,6 +107,23 @@ int main(int argc,char** argv) {
 
     def test_interpolation_units_and_command_limits(self):
         subprocess.run([str(self.binary), str(self.write_csv())], check=True)
+
+    def test_gripper_overtravel_is_clamped_but_large_miss_rejected(self):
+        def gripper_csv(name, left, right):
+            path = self.directory / name
+            with path.open("w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["time"] + [field for i in range(16) for field in (f"q{i}", f"dq{i}", f"tau{i}")])
+                for instant in (0, 1):
+                    row = [instant]
+                    for i in range(16):
+                        q = left if i == 7 else right if i == 15 else 0
+                        row.extend((q, 0, 0))
+                    writer.writerow(row)
+            return path
+        near = gripper_csv("gripper_near.csv", -1.03, 0.65)
+        far = gripper_csv("gripper_far.csv", -1.20, 0.0)
+        subprocess.run([str(self.binary), str(near), "gripper", str(far)], check=True)
 
     def test_rounding_at_limits_is_clamped_but_larger_violations_rejected(self):
         path = self.write_csv("rounding.csv")

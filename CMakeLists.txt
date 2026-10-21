@@ -117,3 +117,6 @@ target_link_libraries(unitree_style_test PRIVATE human_mimic_test_core pthread)
 
 add_executable(teleop_gravity_test tests/teleop_gravity_test.cpp)
 target_link_libraries(teleop_gravity_test PRIVATE vr_control_core pthread)
+
+add_executable(trajectory_spline_test tests/trajectory_spline_test.cpp)
+target_include_directories(trajectory_spline_test PRIVATE src)

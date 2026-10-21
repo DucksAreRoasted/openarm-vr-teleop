@@ -30,6 +30,11 @@ double arm_error(const Pose& a, const Pose& b) {
     for (size_t i = 0; i < 16; ++i) if (i%8 != 7) error = std::max(error, std::abs(a[i]-b[i]));
     return error;
 }
+double pose_gap(const Pose& a, const Pose& b) {
+    double gap = 0;
+    for (size_t i = 0; i < 16; ++i) gap = std::max(gap, std::abs(a[i]-b[i]));
+    return gap;
+}
 
 // Only change the next run while holding an endpoint, never mid-motion.
 void update_repeat(const std::string& command, bool holding, int& repeat) {
@@ -72,7 +77,11 @@ void preview(const TeachingTrajectory& trajectory, const std::string& xml,
     const auto first = trajectory.sample(0);
     ReplayPreparation preparation(startup_file, transition_sec, hold_sec);
     preparation.reset(initial, first.position, true);
-    double alignment_duration = preparation.duration();
+    // Manual start parks on the startup pose. The recording's own first frame
+    // is often not a left/right mirror, so connecting to it is part of playback.
+    bool park_at_startup = wait_for_start && preparation.startup_duration() > 1e-9;
+    bool holding_startup = false;
+    double alignment_duration = park_at_startup ? preparation.startup_duration() : preparation.duration();
     using Clock = std::chrono::steady_clock;
     auto anchor = Clock::now(), next_log = anchor;
     double offset = 0;
@@ -105,10 +114,27 @@ void preview(const TeachingTrajectory& trajectory, const std::string& xml,
                 if (command == "resume" && paused && !ready) { anchor = now; paused = false; }
                 if (command == "play" && ready) {
                     ready = false; wait_at_start = false; paused = false;
+                    if (holding_startup) {
+                        const auto parked = preparation.sample(preparation.startup_duration()).position;
+                        holding_startup = false;
+                        if (pose_gap(parked, first.position) > 1e-3) {
+                            preparation.reset(parked, first.position, true, false);
+                            alignment_duration = preparation.duration();
+                            position = offset = 0; anchor = now; next_log = now;
+                            aligning = alignment_duration > 1e-6;
+                            if (aligning) {
+                                std::cout << "[replay] ALIGNING mode=preview from startup pose transition_seconds="
+                                          << alignment_duration << std::endl;
+                                continue;
+                            }
+                        }
+                    }
                     position = offset = 0; anchor = now; next_log = now;
                     std::cout << "[replay] PLAYING mode=preview loop=1 speed=" << speed << std::endl;
                 }
                 if (command == "prepare" && complete) {
+                    holding_startup = false;
+                    park_at_startup = false;
                     initial = trajectory.sample(trajectory.duration()).position;
                     preparation.reset(initial, first.position, true, false);
                     alignment_duration = preparation.duration();
@@ -160,6 +186,8 @@ void preview(const TeachingTrajectory& trajectory, const std::string& xml,
             aligning = false;
             position = offset = 0; anchor = now; next_log = now;
             ready = wait_at_start;
+            if (ready && park_at_startup) holding_startup = true;
+            park_at_startup = false;
             if (ready) std::cout << "[replay] READY: holding first frame; waiting for play" << std::endl;
             else std::cout << "[replay] PLAYING mode=preview speed=" << speed << std::endl;
         }
@@ -181,7 +209,8 @@ void preview(const TeachingTrajectory& trajectory, const std::string& xml,
             }
         }
         auto goal = trajectory.sample(aligning ? 0 : position);
-        if (aligning) goal = preparation.sample(position);
+        if (aligning) goal = preparation.sample(std::min(position, preparation.duration()));
+        else if (ready && holding_startup) goal = preparation.sample(preparation.startup_duration());
         auto restore = [&](MujocoTeleopHardware& arm, size_t start) {
             std::vector<openarm::damiao_motor::MITParam> commands;
             for (size_t i = start; i < start+7; ++i) {
@@ -267,7 +296,12 @@ int main(int argc, char** argv) {
         // Validate the entire input offline, before constructing/enabling hardware.
         TeachingTrajectory trajectory;
         trajectory.load(csv);
-        trajectory.convert_grippers(source_meters, simulation);
+        const size_t gripper_clamped = trajectory.convert_grippers(source_meters, simulation);
+        if (gripper_clamped) {
+            std::cout << "[replay] NORMALIZED gripper_samples=" << gripper_clamped
+                      << (source_meters ? " tolerance_m=0.002" : " tolerance_rad=0.08")
+                      << " (encoder overtravel clamped to stroke)" << std::endl;
+        }
         Pose lower{}, upper{};
         for (size_t arm = 0; arm < 2; ++arm) {
             const std::string side = arm == 0 ? "left" : "right";
@@ -284,8 +318,10 @@ int main(int argc, char** argv) {
         const size_t normalized = trajectory.validate_limits(lower, upper);
         if (normalized) {
             std::cout << "[replay] NORMALIZED boundary_values=" << normalized
-                      << " tolerance_rad=1e-6 (CSV rounding; exact URDF bounds restored)" << std::endl;
+                      << " tolerance_rad=0.01 (encoder overtravel clamped to URDF bounds)" << std::endl;
         }
+        std::cout << "[replay] SPLINE clamped-cubic frames=" << trajectory.size()
+                  << " sample_dt=0.005 (knot times kept, end velocity 0)" << std::endl;
         std::cout << "[replay] CHECKED frames=" << trajectory.size() << " duration=" << trajectory.duration()
                   << " speed=" << speed << (simulation ? " (recorded pose preview)" :
                       " (recorded torques ignored; gravity recomputed)") << std::endl;
@@ -322,11 +358,19 @@ int main(int argc, char** argv) {
         bool preparing = !startup_file.empty();
         bool aligning = true, paused = false, complete = false;
         bool wait_at_start = wait_for_start, ready = false;
+        // Park on the startup end while waiting for play. That pose is the
+        // mirrored rest. The recording first frame is reached after play.
+        bool release_at_startup = wait_at_start && preparing && preparation.startup_duration() > 1e-9;
+        bool hold_startup_ready = false;
+        Pose startup_hold{};
         double position = 0, phase_time = 0, settled = 0;
         auto previous = std::chrono::steady_clock::now()-std::chrono::milliseconds(5);
         auto next = std::chrono::steady_clock::now(), next_log = next;
         std::string input;
-        std::cout << "[replay] ALIGNING: slow transition from measured pose to first frame" << std::endl;
+        std::cout << "[replay] ALIGNING: "
+                  << (release_at_startup ? "startup trajectory to the mirrored rest pose"
+                                         : "slow transition from measured pose to first frame")
+                  << std::endl;
         while (running) {
             const auto now = std::chrono::steady_clock::now();
             const double dt = std::chrono::duration<double>(now-previous).count();
@@ -346,12 +390,30 @@ int main(int argc, char** argv) {
                     if (command == "play" && ready) {
                         ready = false; wait_at_start = false; paused = false;
                         phase_time = 0; next_log = now;
-                        std::cout << "[replay] PLAYING" << std::endl;
+                        const auto target = trajectory.sample(0).position;
+                        if (hold_startup_ready && pose_gap(startup_hold, target) > 1e-3) {
+                            preparation.reset(startup_hold, target, false, false);
+                            hold_startup_ready = false;
+                            release_at_startup = false;
+                            preparing = true;
+                            aligning = true;
+                            preparation_time = 0;
+                            std::cout << "[replay] ALIGNING: from startup pose to recording first frame transition_seconds="
+                                      << preparation.duration() << std::endl;
+                        } else {
+                            hold_startup_ready = false;
+                            preparing = false;
+                            aligning = false;
+                            position = 0;
+                            std::cout << "[replay] PLAYING" << std::endl;
+                        }
                     }
                     if ((command == "prepare" || (command == "restart" && !wait_for_start)) && complete) {
                         position = 0; phase_time = 0; settled = 0;
                         cycle = 1; paused = false; complete = false; aligning = true;
                         ready = false; wait_at_start = command == "prepare";
+                        hold_startup_ready = false;
+                        release_at_startup = false;
                         const Pose held = reference.position();
                         const Pose target = trajectory.sample(0).position;
                         preparation_job.start([startup_file, transition_sec, hold_sec, held, target]() {
@@ -381,10 +443,20 @@ int main(int argc, char** argv) {
                 goal.velocity.fill(0);
             }
             const bool timed_startup = preparing && preparation.startup_active(preparation_time);
-            const bool catching_up = !timed_startup && arm_error(goal.position, reference.position()) > .03;
-            for (auto& v : goal.velocity) {
-                v *= (!paused && !catching_up && preparing) ? 1 :
-                    ((!aligning && !paused && !complete && !ready && !catching_up) ? speed : 0);
+            // Lag slows the spline clock. Freezing it cuts the continuous velocity
+            // back into steps, which shows up as tip shake.
+            const double lag = timed_startup ? 0.0 : arm_error(goal.position, reference.position());
+            const double rate = lag <= 0.03 ? 1.0 : std::clamp(0.03 / lag, 0.2, 1.0);
+            if (!paused && preparing) {
+                for (auto& v : goal.velocity) v *= rate;
+            } else if (!aligning && !paused && !complete && !ready) {
+                for (auto& v : goal.velocity) v *= speed * rate;
+            } else {
+                goal.velocity.fill(0);
+            }
+            if (ready && hold_startup_ready) {
+                goal.position = startup_hold;
+                goal.velocity.fill(0);
             }
             const auto measured = join(left.pose(), right.pose());
             if (paused) {
@@ -408,12 +480,22 @@ int main(int argc, char** argv) {
                 }
                 // The shared startup uses wall time, as in Quest. Only the
                 // separate connection to the recording waits for catch-up.
-                if (preparing && (timed_startup || (!catching_up && arm_error(goal.position, measured) < .12))) {
-                    preparation_time = std::min(preparation.duration(), preparation_time+dt);
+                const double prep_limit = release_at_startup ? preparation.startup_duration() : preparation.duration();
+                if (preparing && arm_error(goal.position, measured) < .12) {
+                    const double prep_rate = timed_startup ? 1.0 : rate;
+                    preparation_time = std::min(prep_limit, preparation_time + dt * prep_rate);
                 }
-                if ((!preparing || preparation_time >= preparation.duration()) &&
-                    arm_error(trajectory.sample(0).position, reference.position()) < .015 &&
-                    arm_error(trajectory.sample(0).position, measured) < .12) {
+                const Pose settle = (release_at_startup && preparing)
+                    ? preparation.sample(prep_limit).position
+                    : trajectory.sample(0).position;
+                if ((!preparing || preparation_time >= prep_limit) &&
+                    arm_error(settle, reference.position()) < .015 &&
+                    arm_error(settle, measured) < .12) {
+                    if (release_at_startup) {
+                        startup_hold = settle;
+                        hold_startup_ready = true;
+                    }
+                    release_at_startup = false;
                     preparing = false;
                     aligning = false; phase_time = 0;
                     ready = wait_at_start;
@@ -421,7 +503,7 @@ int main(int argc, char** argv) {
                     else std::cout << "[replay] PLAYING" << std::endl;
                 }
             } else if (!aligning && !paused && !complete && !ready) {
-                if (!catching_up) position = std::min(trajectory.duration(), position+dt*speed);
+                position = std::min(trajectory.duration(), position + dt * speed * rate);
                 if (position >= trajectory.duration()) {
                     const bool at_end = arm_error(goal.position, reference.position()) < .015 && arm_error(goal.position, measured) < .12;
                     settled = at_end ? settled+dt : 0;
@@ -441,7 +523,7 @@ int main(int argc, char** argv) {
             }
             if (now >= next_log) {
                 std::cout << "[replay] PROGRESS time=" << position << " duration=" << trajectory.duration()
-                          << " phase=" << (complete ? "complete" : ready ? "ready" : paused ? "paused" : preparation_job.busy() ? "preparing" : aligning ? (preparing ? preparation.phase(preparation_time) : "aligning") : "playing")
+                          << " phase=" << (complete ? "complete" : ready ? "ready" : paused ? "paused" : preparation_job.busy() ? "preparing" : aligning ? (preparing ? (release_at_startup && preparation_time + 1e-6 >= preparation.startup_duration() ? "startup" : preparation.phase(preparation_time)) : "aligning") : "playing")
                           << " loop=" << cycle << " loops=" << (repeat == 0 ? "inf" : std::to_string(repeat))
                           << " preparation_time=" << preparation_time
                           << " startup_duration=" << preparation.startup_duration()

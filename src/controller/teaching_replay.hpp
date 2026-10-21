@@ -1,6 +1,7 @@
 #pragma once
 
 #include <controller/gripper_follow.hpp>
+#include <controller/s_curve.hpp>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -55,6 +56,7 @@ public:
             }
         }
         if (frames_.size() < 2) throw std::runtime_error("trajectory needs at least two frames");
+        invalidate_spline();
         const double start = frames_.front().time;
         for (auto& frame : frames_) frame.time -= start;
         for (size_t n = 1; n < frames_.size(); ++n) for (size_t i = 0; i < 16; ++i) {
@@ -64,24 +66,40 @@ public:
             }
         }
     }
-    void convert_grippers(bool source_meters, bool simulation) {
+    // Nominal stroke is −0.98..0.62 rad (open..closed), or 0..0.044 m in simulation.
+    // Encoder readings can sit a few degrees past a stop; clamp those onto the
+    // stroke. A larger miss is a unit or recording error and is still rejected.
+    size_t convert_grippers(bool source_meters, bool simulation) {
+        const double tolerance = source_meters ? 0.002 : 0.08;
+        size_t clamped = 0;
         for (auto& frame : frames_) for (size_t i : {7u, 15u}) {
             const double lo = source_meters ? 0 : -.98, hi = source_meters ? .044 : .62;
-            const double q = frame.position[i];
-            if (q < lo || q > hi) throw std::runtime_error("gripper outside selected source units/stroke");
+            double q = frame.position[i];
+            if (q < lo - tolerance || q > hi + tolerance) {
+                throw std::runtime_error("gripper outside selected source units/stroke");
+            }
+            if (q < lo || q > hi) {
+                q = std::clamp(q, lo, hi);
+                ++clamped;
+            }
             if (source_meters != simulation) {
-                const double ratio = (q-lo)/(hi-lo);
-                frame.position[i] = simulation ? .044*ratio : -.98+1.6*ratio;
+                const double ratio = (q - lo) / (hi - lo);
+                frame.position[i] = simulation ? .044 * ratio : -.98 + 1.6 * ratio;
+            } else {
+                frame.position[i] = q;
             }
         }
+        invalidate_spline();
+        return clamped;
     }
     size_t validate_limits(const Pose& lower, const Pose& upper) {
         size_t normalized = 0;
         for (size_t row = 0; row < frames_.size(); ++row) for (size_t i = 0; i < 16; ++i) {
             const double q = frames_[row].position[i];
-            // The recorder rounds arm positions to six decimal places. Accept
-            // only that quantization error, then restore the exact URDF bound.
-            const double tolerance = i%8 == 7 ? 0 : 1e-6;
+            // Drag teaching stores raw encoder readings, which can sit a fraction
+            // of a degree past the URDF stop. Clamp that back onto the bound.
+            // Larger violations are still rejected. Grippers stay exact.
+            const double tolerance = i%8 == 7 ? 0 : 0.01;
             if (q < lower[i] || q > upper[i]) {
                 if (q >= lower[i]-tolerance && q <= upper[i]+tolerance) {
                     frames_[row].position[i] = std::clamp(q, lower[i], upper[i]);
@@ -94,21 +112,33 @@ public:
                     std::to_string(lower[i]) + "," + std::to_string(upper[i]) + "]");
             }
         }
+        invalidate_spline();
         return normalized;
     }
+    // Clamped cubic through every recorded joint position. Knot times stay put,
+    // so playback speed matches the recording. End velocity is 0; interior
+    // velocity is continuous. The 5 ms replay loop samples this directly.
     Sample sample(double time) const {
         if (frames_.empty() || !std::isfinite(time)) throw std::runtime_error("invalid replay sample");
-        if (time <= 0) return frames_.front();
-        if (time >= duration()) return frames_.back();
+        ensure_spline();
+        if (time <= 0) return endpoint(frames_.front());
+        if (time >= duration()) return endpoint(frames_.back());
         auto high = std::upper_bound(frames_.begin(), frames_.end(), time,
                                     [](double t, const Sample& frame) { return t < frame.time; });
         const auto& b = *high;
         const auto& a = *(high-1);
-        const double interval = b.time-a.time, alpha = (time-a.time)/interval;
+        const size_t index = static_cast<size_t>(high - frames_.begin() - 1);
+        const double span = b.time - a.time;
+        const double mix = (time - a.time) / span;
         Sample out{time};
         for (size_t i = 0; i < 16; ++i) {
-            out.position[i] = a.position[i]+alpha*(b.position[i]-a.position[i]);
-            out.velocity[i] = (b.position[i]-a.position[i])/interval;
+            openarm::scurve::cubic_hermite(a.position[i], b.position[i], slopes_[i][index],
+                                           slopes_[i][index + 1], span, mix,
+                                           &out.position[i], &out.velocity[i]);
+            if (out.position[i] < joint_min_[i] || out.position[i] > joint_max_[i]) {
+                out.position[i] = std::clamp(out.position[i], joint_min_[i], joint_max_[i]);
+                out.velocity[i] = 0;
+            }
         }
         return out;
     }
@@ -127,7 +157,36 @@ private:
         if (!line.empty() && line.back() == ',') cells.emplace_back();
         return cells;
     }
+    void invalidate_spline() const {
+        for (auto& slope : slopes_) slope.clear();
+    }
+    static Sample endpoint(Sample frame) {
+        frame.velocity.fill(0);
+        return frame;
+    }
+    void ensure_spline() const {
+        if (slopes_[0].size() == frames_.size()) return;
+        std::vector<double> times(frames_.size());
+        for (size_t joint = 0; joint < 16; ++joint) {
+            joint_min_[joint] = frames_.front().position[joint];
+            joint_max_[joint] = joint_min_[joint];
+        }
+        for (size_t row = 0; row < frames_.size(); ++row) {
+            times[row] = frames_[row].time;
+            for (size_t joint = 0; joint < 16; ++joint) {
+                joint_min_[joint] = std::min(joint_min_[joint], frames_[row].position[joint]);
+                joint_max_[joint] = std::max(joint_max_[joint], frames_[row].position[joint]);
+            }
+        }
+        for (size_t joint = 0; joint < 16; ++joint) {
+            std::vector<double> values(frames_.size());
+            for (size_t row = 0; row < frames_.size(); ++row) values[row] = frames_[row].position[joint];
+            slopes_[joint] = openarm::scurve::clamped_cubic_slopes(times, values);
+        }
+    }
     std::vector<Sample> frames_;
+    mutable std::array<std::vector<double>, 16> slopes_{};
+    mutable Pose joint_min_{}, joint_max_{};
 };
 
 class TeachingReplayReference {

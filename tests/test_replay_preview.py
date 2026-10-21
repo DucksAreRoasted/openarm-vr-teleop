@@ -115,6 +115,34 @@ class ReplayPreviewTests(unittest.TestCase):
         self.assertAlmostEqual(ready_again-returned, 4.125, delta=.35)
         self.wait_for("phase=ready")
 
+    def test_ready_holds_startup_end_instead_of_recording_first_frame(self):
+        startup = Path(self.temporary.name) / "startup.csv"
+        with startup.open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["time"] + [name for i in range(16) for name in (f"q{i}", f"dq{i}")])
+            for instant, angle in ((0, 0), (.4, .3)):
+                row = [instant]
+                for i in range(16):
+                    q = -.98 if i % 8 == 7 else (1.57 if i % 8 == 3 else (angle if i == 0 else 0))
+                    row.extend((q, 0))
+                writer.writerow(row)
+        previous = os.environ.get("OPENARM_QUEST_STARTUP_HOLD_SEC")
+        os.environ["OPENARM_QUEST_STARTUP_HOLD_SEC"] = "0"
+        try:
+            self.start(duration=.2, manual_start=True, wait_for_playing=False,
+                       startup=startup, transition_sec=.2)
+        finally:
+            if previous is None:
+                os.environ.pop("OPENARM_QUEST_STARTUP_HOLD_SEC", None)
+            else:
+                os.environ["OPENARM_QUEST_STARTUP_HOLD_SEC"] = previous
+        _, line = self.wait_for("phase=ready", timeout=8)
+        self.assertAlmostEqual(float(line.split("q0=")[1].split()[0]), .3, places=2)
+        self.command("play")
+        self.wait_for("from startup pose")
+        self.wait_for("[replay] PLAYING", timeout=8)
+        self.wait_for("[replay] COMPLETE", timeout=8)
+
     def test_fast_motion_at_one_and_half_speed(self):
         for speed in (1, .5):
             with self.subTest(speed=speed):

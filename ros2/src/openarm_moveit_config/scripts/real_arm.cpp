@@ -144,45 +144,21 @@ struct Trajectory {
     std::vector<std::array<double, 7>> velocities;
 };
 
-// Keep MoveIt knot times/poses; densify each segment with an S-shaped mix so
-// acceleration eases in/out without retiming the whole path (avoids timeout /
-// tracking abort from a longer schedule, and avoids stop-go rest-to-rest).
+// Keep MoveIt knot times. One clamped cubic spline over the whole path so
+// interior knots keep a continuous velocity. Per-segment smootherstep stopped
+// at every knot. Sample dq is stored on every frame, including the first, so
+// sample() feeds it to MIT instead of falling back to a position difference.
 Trajectory densify_trajectory_scurve(const Trajectory& input, double sample_dt) {
     Trajectory out;
     out.active = input.active;
     if (input.points.size() < 2 || input.times.size() != input.points.size()) {
         return input;
     }
-
-    sample_dt = std::clamp(sample_dt, 0.002, 0.05);
-    out.times.push_back(input.times.front());
-    out.points.push_back(input.points.front());
-
-    for (size_t i = 1; i < input.points.size(); ++i) {
-        const double t0 = input.times[i - 1];
-        const double t1 = input.times[i];
-        const double T = std::max(t1 - t0, 1e-4);
-        const int steps = std::max(1, static_cast<int>(std::ceil(T / sample_dt)));
-        for (int step = 1; step <= steps; ++step) {
-            const double raw = static_cast<double>(step) / static_cast<double>(steps);
-            const double mix = openarm::scurve::unit_smooth(raw);
-            const double mix_dot = openarm::scurve::unit_smooth_dot(raw);  // d(mix)/d(raw)
-            std::array<double, 7> q{};
-            std::array<double, 7> dq{};
-            for (size_t j = 0; j < 7; ++j) {
-                const double delta = input.points[i][j] - input.points[i - 1][j];
-                q[j] = input.points[i - 1][j] + mix * delta;
-                // dq/dt = d(mix)/d(raw) * d(raw)/dt * delta
-                dq[j] = mix_dot * (delta / T);
-            }
-            out.times.push_back(t0 + raw * T);
-            out.points.push_back(q);
-            out.velocities.push_back(dq);
-        }
-    }
-    if (!out.velocities.empty()) {
-        out.velocities.back().fill(0.0);
-    }
+    const openarm::scurve::DenseJointPath dense =
+        openarm::scurve::densify_clamped_cubic(input.times, input.points, sample_dt);
+    out.times = dense.times;
+    out.points = dense.points;
+    out.velocities = dense.velocities;
     return out;
 }
 
@@ -552,11 +528,7 @@ public:
         last_track_wall_ = wall_now;
         dt = std::clamp(dt, 0.0, 0.05);
 
-        // Error vs the command we are already asking for.
-        double err = 0.0;
-        for (size_t i = 0; i < command_.size(); ++i) {
-            err = std::max(err, std::abs(command_[i] - measured_[i]));
-        }
+        const double err = tracking_error_locked();
         // Time-warp: freeze / slow when the human (or obstacle) holds the arm.
         double rate = 1.0;
         if (err > stall_error_) {
@@ -574,11 +546,7 @@ public:
         if (trajectory_.virtual_time >= t_end) {
             velocity_.fill(0.0);
             // Only finish after the arm actually catches the final point.
-            double final_err = 0.0;
-            for (size_t i = 0; i < command_.size(); ++i) {
-                final_err = std::max(final_err, std::abs(command_[i] - measured_[i]));
-            }
-            if (final_err < settle_error_) {
+            if (tracking_error_locked() < settle_error_) {
                 trajectory_.active = false;
             }
         }
@@ -591,14 +559,18 @@ public:
 
     double max_tracking_error() {
         std::lock_guard<std::mutex> lock(mutex_);
+        return tracking_error_locked();
+    }
+
+private:
+    double tracking_error_locked() const {
         double err = 0.0;
-        for (size_t i = 0; i < command_.size(); ++i) {
-            err = std::max(err, std::abs(command_[i] - measured_[i]));
+        for (size_t index = 0; index < command_.size(); ++index) {
+            err = std::max(err, std::abs(command_[index] - measured_[index]));
         }
         return err;
     }
 
-private:
     void read() {
         std::lock_guard<std::mutex> lock(mutex_);
         read_locked();
@@ -714,9 +686,7 @@ private:
         for (size_t index = 0; index < command_.size(); ++index) {
             const double grav =
                 compose_gravity_torque(gravity[index], tune_, index, model_.ff_gain);
-            const double fric = friction_torque(measured_vel_[index], tune_.fc[index],
-                                               tune_.fv[index], tune_.fk[index]);
-            const double model_tau = grav + fric;
+            const double model_tau = grav;
             const double err = command_[index] - measured_[index];
             const double vel_err = velocity_[index] - measured_vel_[index];
             spring[index] = nonlinear_spring_torque(err, restore_cap_[index], restore_width_);
@@ -758,7 +728,10 @@ private:
                 (index < kMoveItTauFfLimits.size()) ? kMoveItTauFfLimits[index] : 20.0;
             tau = std::clamp(tau, -ff_lim, ff_lim);
             const double total_lim = 0.8 * motor_tmax_nm()[index];
-            const double pd_mag = std::abs(kp_[index] * err) + std::abs(kd_[index] * vel_err);
+            const double q_cmd = command_[index];
+            const double dq_cmd = velocity_[index];
+            const double pd_mag = std::abs(kp_[index] * (q_cmd - measured_[index])) +
+                                  std::abs(kd_[index] * (dq_cmd - measured_vel_[index]));
             if (pd_mag + std::abs(tau) > total_lim) {
                 const double room = std::max(0.0, total_lim - pd_mag);
                 const double scale = std::abs(tau) > 1e-9 ? room / std::abs(tau) : 0.0;
@@ -766,7 +739,7 @@ private:
                 clipped = true;
             }
             tau_ff[index] = tau;
-            arm.push_back({kp_[index], kd_[index], command_[index], velocity_[index], tau_ff[index]});
+            arm.push_back({kp_[index], kd_[index], q_cmd, dq_cmd, tau_ff[index]});
         }
         if (clipped && (log_div_ % 50) == 0) {
             RCLCPP_WARN(rclcpp::get_logger("real_arm"),
@@ -779,7 +752,8 @@ private:
             }
         }
         hardware_->get_arm().mit_control_all(arm);
-        hardware_->get_gripper().mit_control_all({{GRIPPER_KP, GRIPPER_KD, gripper_hold_, 0.0, 0.0}});
+        hardware_->get_gripper().mit_control_all(
+            {{GRIPPER_KP, GRIPPER_KD, gripper_hold_, 0.0, 0.0}});
         if (tau_ext_pub_) {
             std_msgs::msg::Float64MultiArray message;
             message.data.assign(tau_ext.begin(), tau_ext.end());

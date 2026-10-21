@@ -18,7 +18,7 @@ class TrajectorySmoothDialog(QDialog):
 
     def __init__(self, source: Path, parent=None) -> None:
         super().__init__(parent)
-        if parent is None: self.setStyleSheet(APP_STYLE)
+        self.setStyleSheet(APP_STYLE)
         self.source = source
         self.report: dict | None = None
         self._output = bytearray()

@@ -98,6 +98,53 @@ int main(int argc, char** argv) {
                             str(source), str(ROOT / 'src/io/teleop_io.cpp'), '-o', str(binary)], check=True)
             subprocess.run([str(binary), str(startup)], check=True)
 
+    def test_mirrored_startup_gathers_the_right_arm_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            startup = directory / 'startup.csv'
+            with startup.open('w', newline='') as handle:
+                writer = csv.writer(handle)
+                writer.writerow(['time'] + [name for i in range(16) for name in (f'q{i}', f'dq{i}')])
+                for instant, angle in ((0, 0), (1, .2)):
+                    row = [instant]
+                    for joint in range(16):
+                        value = angle if joint == 0 else -angle if joint == 8 else 0
+                        row.extend((value, 0))
+                    writer.writerow(row)
+            source = directory / 'gather.cpp'
+            binary = directory / 'gather'
+            source.write_text(r'''
+#include <controller/replay_preparation.hpp>
+#include <cassert>
+#include <cmath>
+int main(int argc, char** argv) {
+    assert(argc == 2);
+    TeachingTrajectory::Pose current{}, target{};
+    current[0] = .1;
+    current[8] = .1; // not the mirror; mirror of the left shoulder is -.1
+    ReplayPreparation prep(argv[1], .4, 0);
+    prep.reset(current, target, false);
+    const auto start = prep.sample(0);
+    assert(std::abs(start.position[0]-.1) < 1e-6);
+    assert(std::abs(start.position[8]-.1) < 1e-6);
+    const auto gathered = prep.sample(.4);
+    assert(std::abs(gathered.position[0]-.1) < 1e-3);
+    assert(std::abs(gathered.position[8]+.1) < 1e-3);
+    bool mirrored_motion = false;
+    for (int step = 1; step <= 40; ++step) {
+        const auto sample = prep.sample(prep.startup_duration()*step/40.);
+        if (sample.position[0] > .15) {
+            mirrored_motion = true;
+            assert(std::abs(sample.position[8]+sample.position[0]) < 1e-3);
+        }
+    }
+    assert(mirrored_motion);
+}
+''')
+            subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-I', str(ROOT / 'src'),
+                            str(source), str(ROOT / 'src/io/teleop_io.cpp'), '-o', str(binary)], check=True)
+            subprocess.run([str(binary), str(startup)], check=True)
+
     def test_launcher_uses_quest_startup_configuration(self):
         import os
         import sys
