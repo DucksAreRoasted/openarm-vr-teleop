@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <vector>
 
 namespace gravity_calibration {
@@ -117,6 +118,50 @@ inline std::array<int, 2> approach_order(const Pose& at_left, const Pose& at_rig
     };
     return cost(-1) < cost(1) ? std::array<int, 2>{-1, 1} : std::array<int, 2>{1, -1};
 }
+
+// Speed across a short position window. One 16-bit encoder step is about
+// 0.0004 rad; divided by a single 10 ms sample it exceeds 0.05 rad/s and would
+// reset every dwell even though the joint is stopped.
+class SettleSpeed {
+public:
+    static constexpr double kWindowS = 0.20;
+
+    void push(double time, const Pose& q) {
+        if (!samples_.empty() && time + 1e-9 < samples_.back().time) {
+            samples_.clear();
+        }
+        samples_.push_back({time, q});
+        while (samples_.size() > 2 && time - samples_[1].time >= kWindowS) {
+            samples_.pop_front();
+        }
+    }
+
+    double speed() const {
+        if (samples_.size() < 2) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const double dt = samples_.back().time - samples_.front().time;
+        if (dt < kWindowS * 0.75) {
+            return std::numeric_limits<double>::infinity();
+        }
+        double peak = 0.0;
+        for (size_t joint = 0; joint < samples_.back().q.size(); ++joint) {
+            const double delta = samples_.back().q[joint] - samples_.front().q[joint];
+            if (!std::isfinite(delta)) {
+                return std::numeric_limits<double>::infinity();
+            }
+            peak = std::max(peak, std::abs(delta) / dt);
+        }
+        return peak;
+    }
+
+private:
+    struct Sample {
+        double time;
+        Pose q;
+    };
+    std::deque<Sample> samples_;
+};
 
 // Early completion requires a full quiet observation window on BOTH arms.
 // Dwell still runs to its original 3 s limit if the plateau is not stable.

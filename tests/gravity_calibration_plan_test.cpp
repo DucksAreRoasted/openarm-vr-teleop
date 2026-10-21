@@ -47,6 +47,31 @@ int main() {
         torque[5] = (i % 2) ? 0.03 : -0.03;
         assert(!noisy_torque.update(i * 0.01, true, zero, zero, torque, zero));
     }
+    // Two encoder counts every 10 ms used to look faster than 0.05 rad/s.
+    SettleSpeed dither;
+    for (int i = 0; i < 40; ++i) {
+        Pose noisy{};
+        noisy[3] = (i % 2) ? 0.0008 : -0.0008;
+        dither.push(i * 0.01, noisy);
+    }
+    assert(dither.speed() < 0.05);
+    SettleSpeed creep;
+    for (int i = 0; i < 40; ++i) {
+        Pose moving{};
+        moving[0] = i * 0.01 * 0.08;
+        creep.push(i * 0.01, moving);
+    }
+    assert(creep.speed() > 0.05 && creep.speed() < 0.12);
+    SettleSpeed spike;
+    Pose held{};
+    for (int i = 0; i < 5; ++i) spike.push(i * 0.01, held);
+    held[1] = 0.01;
+    for (int i = 0; i < 30; ++i) spike.push(0.05 + i * 0.01, held);
+    assert(spike.speed() < 0.05);
+    SettleSpeed fresh;
+    fresh.push(0.0, zero);
+    assert(fresh.speed() > 1e6);
+
     assert(!stable.update(1.22, false, zero, zero, zero, zero));
     assert(!stable.update(1.23, true, zero, zero, zero, zero));
     StableHoldWindow sparse;
