@@ -48,12 +48,15 @@ class LogReaderTests(unittest.TestCase):
             "INFO",
         )
         self.assertEqual(classify("[replay][ERROR] alignment timed out"), "ERROR")
+<<<<<<< HEAD
         self.assertEqual(classify("[FATAL] stopped"), "FATAL")
         self.assertEqual(classify("[openarm_real_arm] FATAL: boom"), "FATAL")
         self.assertEqual(
             classify("Start with moderate motions; Ctrl+C / record-panel 退出 / fatal lock:"),
             "INFO",
         )
+=======
+>>>>>>> origin/main
 
 
 @unittest.skipUnless(QT_AVAILABLE, "PySide6 required")
