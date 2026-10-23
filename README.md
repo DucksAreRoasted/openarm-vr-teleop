@@ -1,5 +1,7 @@
 # OpenArm VR 遥操作
 
+> 首次安装与操作请阅读 [OpenArm Teleop 安装与使用说明书](README_USER_GUIDE.md)，包含环境安装、Quest 连接、真机操作、采集回放及故障排查。
+
 从 Motion Trajectory Studio 拆出的 Quest 3 / OpenArm 双臂遥操作。不依赖编辑器，仿真和真机都从本目录启动。
 
 控制台固定使用宇树参考 `unitree_style`。姿态映射是绝对标定：第一次握住 Grip 锁定手柄到夹爪的朝向，之后松开再握只重锚位置。握住 Grip 后同时按 A+B（右）或 X+Y（左）可以重新标定朝向。
