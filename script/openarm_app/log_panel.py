@@ -62,7 +62,8 @@ class LogEntry:
 
 
 def classify(text: str) -> str:
-    if re.search(r"\bFATAL\b", text, re.IGNORECASE):
+    # Only a level marker. The startup banner says "fatal lock" and is not a fault.
+    if re.search(r"\[FATAL\]|\bFATAL:", text, re.IGNORECASE):
         level = "FATAL"
     else:
         warning = re.search(r"\bWARN(?:ING)?\b|警告", text, re.IGNORECASE)

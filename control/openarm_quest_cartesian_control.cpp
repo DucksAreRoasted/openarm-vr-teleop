@@ -753,7 +753,7 @@ void print_real_hardware_banner() {
               << " Hz; Quest target update @ ~" << kQuestReceiveHz << " Hz.\n"
               << "  - Internal q_ref integration; MIT-PD gets q_des + qdot_des.\n"
               << "  - Hold Grip to teleop, release to hold pose. Re-grip after Quest timeout.\n"
-              << "  - Start with moderate motions; Ctrl+C / record-panel 退出 / fatal lock:\n"
+              << "  - Start with moderate motions; Ctrl+C / record-panel 退出 / 急停锁定:\n"
               << "    freeze joints with MIT Kp/Kd, then disable motors."
               << std::endl;
 }
