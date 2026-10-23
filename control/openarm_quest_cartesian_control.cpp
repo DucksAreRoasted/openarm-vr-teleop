@@ -762,8 +762,8 @@ void print_teleop_help() {
     std::cout << "[quest] Unitree / PIKA teleoperation\n"
               << "  Grip: hold to follow hand position and orientation; release to hold.\n"
               << "  Regrip anchors the current hand pose to the current TCP without a jump.\n"
-              << "  A/X: close gripper; B/Y: open; press again to stop.\n"
-              << "  Grip+Trigger: hold xyz and flip about the tool axis.\n"
+              << "  Front trigger: pull to close the gripper, release to open.\n"
+              << "  A+B / X+Y while holding Grip: recenter orientation.\n"
               << "  Quest timeout: hold references and recover through the clutch.\n"
               << std::endl;
 }

@@ -95,7 +95,7 @@
         </div>
 
         <div id="gripperBanner" class="gripper-banner idle">
-            Gripper: right A=close B=open &nbsp;|&nbsp; left X=close Y=open<br>
+            Gripper: front trigger pull = close, release = open. A+B / X+Y recenter.<br>
             <span style="font-size:16px;font-weight:normal;">Button activity is shown here.</span>
         </div>
         
@@ -314,9 +314,9 @@
                 dataDiv.innerHTML = `
                     <p><strong>Pos:</strong> [${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(2)}]</p>
                     <p><strong>Rot:</strong> [${rotation.x.toFixed(0)}°, ${rotation.y.toFixed(0)}°, ${rotation.z.toFixed(0)}°]</p>
-                    <p><strong>Trigger:</strong> ${trigger ? 'ON' : 'OFF'}</p>
-                    <p><strong>${closeLabel} close:</strong> <span class="${buttonClose ? 'btn-on' : 'btn-off'}">${buttonClose ? '● pressed' : '○ released'}</span></p>
-                    <p><strong>${openLabel} open:</strong> <span class="${buttonOpen ? 'btn-on' : 'btn-off'}">${buttonOpen ? '● pressed' : '○ released'}</span></p>
+                    <p><strong>Front trigger:</strong> ${Number(trigger).toFixed(2)} ${Number(trigger) >= 0.5 ? '(close)' : '(open)'}</p>
+                    <p><strong>${closeLabel}:</strong> <span class="${buttonClose ? 'btn-on' : 'btn-off'}">${buttonClose ? '● pressed' : '○ released'}</span></p>
+                    <p><strong>${openLabel}:</strong> <span class="${buttonOpen ? 'btn-on' : 'btn-off'}">${buttonOpen ? '● pressed' : '○ released'}</span></p>
                 `;
             }
             updateGripperBannerFromState();
@@ -332,15 +332,15 @@
             const anyOpen = lastLeft.open || lastRight.open;
             if (anyClose) {
                 banner.className = 'gripper-banner close-on';
-                banner.innerHTML = '● Close button (A / X) sent to PC';
+                banner.innerHTML = '● Front trigger pulled: gripper closing';
             } else if (anyOpen) {
                 banner.className = 'gripper-banner open-on';
-                banner.innerHTML = '● Open button (B / Y) sent to PC';
+                banner.innerHTML = '● Front trigger released: gripper opening';
             } else {
                 banner.className = 'gripper-banner idle';
                 banner.innerHTML =
-                    'Gripper: right A=close B=open &nbsp;|&nbsp; left X=close Y=open<br>' +
-                    '<span style="font-size:16px;font-weight:normal;">Button activity is shown here.</span>';
+                    'Gripper follows the front trigger: pull to close, release to open.<br>' +
+                    '<span style="font-size:16px;font-weight:normal;">A+B or X+Y still recenters orientation.</span>';
             }
         }
 
@@ -450,7 +450,10 @@
                                 if (inputSource.gamepad) {
                                     const buttons = inputSource.gamepad.buttons;
                                     if (buttons.length > 0) {
-                                        trigger = (buttons[0].pressed || buttons[0].value > 0.5) ? 1 : 0;
+                                        const raw = buttons[0].value;
+                                        trigger = Number.isFinite(raw)
+                                            ? Math.max(0, Math.min(1, raw))
+                                            : (buttons[0].pressed ? 1 : 0);
                                     }
                                     if (buttons.length > 1) {
                                         grip = buttons[1].pressed || buttons[1].value > 0.5;
@@ -477,9 +480,9 @@
 
                                 if (refreshDisplays) updateControllerDisplay(inputSource.handedness, controllerInfo.position, controllerInfo.rotation, grip, trigger, buttonClose, buttonOpen);
                                 if (inputSource.handedness === 'left') {
-                                    lastLeft = { close: buttonClose, open: buttonOpen };
+                                    lastLeft = { close: trigger >= 0.5, open: trigger < 0.5 };
                                 } else if (inputSource.handedness === 'right') {
-                                    lastRight = { close: buttonClose, open: buttonOpen };
+                                    lastRight = { close: trigger >= 0.5, open: trigger < 0.5 };
                                 }
                                 if (refreshDisplays) updateGripperBannerFromState();
 

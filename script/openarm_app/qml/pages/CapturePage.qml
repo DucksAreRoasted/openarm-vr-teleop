@@ -143,7 +143,7 @@ Flickable {
             }
 
             Text {
-                text: "按住时约每 0.3 秒轻振一下，满 1.5 秒即执行。丢弃后 10 秒内可撤销。A/B、X/Y 控制夹爪。"
+                text: "按住时约每 0.3 秒轻振一下，满 1.5 秒即执行。丢弃后 10 秒内可撤销。前扳机扣下夹爪闭合，松开张开。握把时 A+B 或 X+Y 重新标定朝向。"
                 color: Theme.muted
                 font.pixelSize: 13
                 wrapMode: Text.WordWrap

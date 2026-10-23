@@ -1261,13 +1261,13 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
     bool holding_open = false;
 
     if (sample.valid) {
-        last_button_close_ = sample.button_close;
-        last_button_open_ = sample.button_open;
-
-        // Hold-to-move: A/X held → close, B/Y held → open.
-        // GraspHolding persists until open (releasing A does NOT release the clamp).
-        const bool want_close = sample.button_close && !sample.button_open;
-        const bool want_open = sample.button_open && !sample.button_close;
+        // Front trigger (index) drives the jaw. Pulled closes; released opens.
+        // Face buttons stay free for the A+B / X+Y orientation recenter.
+        const bool trigger_close = sample.trigger >= config_.trigger_threshold;
+        last_button_close_ = trigger_close;
+        last_button_open_ = !trigger_close;
+        const bool want_close = trigger_close;
+        const bool want_open = !trigger_close;
         holding_close = want_close;
         holding_open = want_open;
         const GripperMotion prev = gripper_motion_;
@@ -1280,7 +1280,7 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
                     gripper_target_ = q_meas;
                     gripper_stall_timer_ = 0.0;
                     gripper_stall_q_ref_ = q_meas;
-                    std::cout << log_prefix_ << "[human-mimic] gripper opening (hold B/Y)"
+                    std::cout << log_prefix_ << "[human-mimic] gripper opening (front trigger released)"
                               << (prev == GripperMotion::GraspHolding ? " [release grasp-hold]"
                                                                       : "")
                               << std::endl;
@@ -1302,7 +1302,7 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
                     gripper_stall_timer_ = 0.0;
                     gripper_stall_q_ref_ = q_meas;
                     gripper_grasp_lag_ = 0.0;
-                    std::cout << log_prefix_ << "[human-mimic] gripper closing (hold A/X)"
+                    std::cout << log_prefix_ << "[human-mimic] gripper closing (front trigger)"
                               << std::endl;
                 }
             } else {
@@ -1320,13 +1320,13 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
                 gripper_motion_ = GripperMotion::Stopped;
                 freeze_close_hold(gripper_target_);
                 gripper_stall_timer_ = 0.0;
-                std::cout << log_prefix_ << "[human-mimic] gripper hold (release A/X) q="
+                std::cout << log_prefix_ << "[human-mimic] gripper hold (front trigger) q="
                           << gripper_hold_pos_ << std::endl;
             } else if (prev == GripperMotion::Opening) {
                 gripper_motion_ = GripperMotion::Stopped;
                 freeze_open_hold();
                 gripper_stall_timer_ = 0.0;
-                std::cout << log_prefix_ << "[human-mimic] gripper hold (release B/Y) q="
+                std::cout << log_prefix_ << "[human-mimic] gripper hold (front trigger open) q="
                           << gripper_hold_pos_ << std::endl;
             }
         }
@@ -1355,7 +1355,7 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
             break;
     }
 
-    // Hold A/X + measured stroke not advancing toward closed → grasp-hold.
+    // Front trigger held and the jaw is not moving toward closed → grasp-hold.
     // Progress gate (primary): must move ≥ stall_progress along close within stall_time.
     // Velocity is only an assist; slow creep against an object still counts as jammed.
     if (config_.gripper_soft_stall && config_.gripper_grasp_hold &&
@@ -1371,7 +1371,7 @@ void HumanMimicController::update_gripper_from_buttons(const QuestPoseSample& sa
                 const double lag_close = close_dir * (gripper_target_ - q_meas);
                 const double seeded = std::clamp(
                     std::max(lag_close, hold_lag_nom), hold_lag_nom * 0.5, hold_lag_max);
-                enter_grasp_hold("hold-A jammed (no close progress)", seeded);
+                enter_grasp_hold("front trigger jammed (no close progress)", seeded);
             }
         }
     } else if (gripper_motion_ != GripperMotion::Closing) {
@@ -2505,10 +2505,10 @@ bool HumanMimicController::step(const std::vector<JointState>& current_joints,
         recenter_orientation(q_meas, sample);
     }
 
-    // Default Trigger action: rotation-only J5-priority mode. Legacy reset remains
-    // available through trigger_twist_mode=false.
-    const bool trigger_now =
-        sample.valid && grip_now && (sample.trigger >= config_.trigger_threshold);
+    // The front trigger is the gripper. Wrist-flip / reset stay on that trigger
+    // only when gripper buttons are off.
+    const bool trigger_now = sample.valid && grip_now && !config_.gripper_buttons_enabled &&
+                             (sample.trigger >= config_.trigger_threshold);
     const bool trigger_rising = !last_trigger_reset_ && trigger_now;
     const bool trigger_falling = last_trigger_reset_ && !trigger_now;
     last_trigger_reset_ = trigger_now;
