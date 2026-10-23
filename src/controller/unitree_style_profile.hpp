@@ -3,8 +3,9 @@
 #include "controller/human_mimic_types.hpp"
 
 // OpenArm adaptation of Unitree's Cartesian pose + joint regularization objective.
-// Uses our bounded LM solver, robot model, clutch and reference generator; does
-// not use Unitree's motor SDK, human body offsets or moving head reference.
+// The live solver is their CasADi/IPOPT problem on this URDF. The LM solver,
+// clutch and reference generator stay as the fallback and the joint smoother.
+// Does not use Unitree's motor SDK, human body offsets or moving head reference.
 inline void apply_unitree_style_profile(HumanMimicConfig* cfg) {
     cfg->consistent_world_mapping = true;
     cfg->position_map_world_frame = true;
@@ -27,4 +28,7 @@ inline void apply_unitree_style_profile(HumanMimicConfig* cfg) {
     cfg->j7_continuity_scale = 1.0;
     cfg->ik_backend = HumanMimicIkBackend::LM;
     cfg->ik_max_iters = 30;
+    // Same cost as xr_teleoperate G1_29_ArmIK. LM remains the fallback if the
+    // Python solver cannot start.
+    cfg->unitree_ipopt = true;
 }

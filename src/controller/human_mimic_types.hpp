@@ -81,6 +81,10 @@ struct HumanMimicConfig {
     // A/B mode uses this instead of deriving rotation axes from controller heading.
     bool consistent_world_mapping = false;
     double reference_yaw_rad = 0.0;  // fixed OpenXR +Y yaw, calibrated before motion
+    // Unitree xr_teleoperate IPOPT (Pinocchio + CasADi). The 1000 Hz loop keeps
+    // the existing joint smoother and CAN gravity feedforward.
+    bool unitree_ipopt = false;
+    std::string unitree_arm_side;
 
     // Fine-motion hold freezes q when tip looks "quiet" — feels sticky on nudges.
     // Default off; slew + IK damping already limit jitter.

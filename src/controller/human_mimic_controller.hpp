@@ -20,6 +20,7 @@
 #include "controller/human_mimic_kinematics.hpp"
 #include "controller/human_mimic_types.hpp"
 #include "controller/joint_reference_generator.hpp"
+#include "controller/unitree_ipopt_client.hpp"
 #include "controller/reference_smoother.hpp"
 #include "controller/virtual_arm_skeleton.hpp"
 #include "robot_state.hpp"
@@ -292,6 +293,7 @@ private:
     bool hold_active_ = false;
     std::vector<double> hold_q_;
 
+    UnitreeIpoptClient unitree_ipopt_;
     bool initialized_ = false;
     std::chrono::steady_clock::time_point last_log_time_{};
     uint64_t log_tick_ = 0;

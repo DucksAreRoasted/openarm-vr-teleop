@@ -1,8 +1,10 @@
 #include "controller/human_mimic_controller.hpp"
+#include "controller/unitree_xr_basis.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -230,6 +232,58 @@ bool HumanMimicController::Init() {
     }
 
     initialized_ = true;
+    if (config_.unitree_ipopt &&
+        (config_.unitree_arm_side == "left" || config_.unitree_arm_side == "right")) {
+        const char* disable = std::getenv("OPENARM_UNITREE_IPOPT");
+        if (disable == nullptr || std::strcmp(disable, "0") != 0) {
+            const char* root_env = std::getenv("OPENARM_ROOT");
+            const std::string root = root_env != nullptr ? root_env : "";
+            const std::string script = (root.empty() ? std::string("script") : root + "/script") +
+                                       "/unitree_openarm/ik_server.py";
+            std::vector<std::string> candidates;
+            const auto consider = [&](const std::string& path) {
+                if (!path.empty() &&
+                    std::find(candidates.begin(), candidates.end(), path) == candidates.end()) {
+                    candidates.push_back(path);
+                }
+            };
+            const char* python_env = std::getenv("OPENARM_PYTHON");
+            if (python_env != nullptr) {
+                consider(python_env);
+            }
+            const char* home = std::getenv("HOME");
+            if (home != nullptr) {
+                for (const char* distro : {"miniconda3", "miniforge3", "mambaforge", "anaconda3"}) {
+                    consider(std::string(home) + "/" + distro +
+                             "/envs/openarm-unitree/bin/python");
+                }
+            }
+            const char* conda_exe = std::getenv("CONDA_EXE");
+            if (conda_exe != nullptr && conda_exe[0] != '\0') {
+                const auto base = std::filesystem::path(conda_exe).parent_path().parent_path();
+                consider((base / "envs" / "openarm-unitree" / "bin" / "python").string());
+            }
+            if (!root.empty()) {
+                consider(root + "/.venv/bin/python");
+            }
+            consider("python3");
+            std::string python;
+            for (const std::string& candidate : candidates) {
+                if (candidate != "python3" && !std::filesystem::exists(candidate)) {
+                    continue;
+                }
+                if (UnitreeIpoptClient::imports_solver(candidate)) {
+                    python = candidate;
+                    break;
+                }
+            }
+            if (python.empty() ||
+                !unitree_ipopt_.start(python, script, config_.urdf_path, config_.unitree_arm_side)) {
+                std::cerr << log_prefix_
+                          << "[unitree-ik] IPOPT 未启动，这一侧继续用现有 LM 逆解" << std::endl;
+            }
+        }
+    }
     std::cout << log_prefix_ << "[human-mimic] gripper buttons="
               << (config_.gripper_buttons_enabled ? 1 : 0)
               << " grasp_hold=" << (config_.gripper_grasp_hold ? 1 : 0)
@@ -291,8 +345,7 @@ bool HumanMimicController::Init() {
 }
 
 Eigen::Matrix3d HumanMimicController::vr_to_robot_axes() const {
-    Eigen::Matrix3d M;
-    M << 0.0, 0.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0;
+    Eigen::Matrix3d M = unitree_robot_from_openxr();
     if (config_.mirror_translation_y) {
         M.row(1) *= -1.0;
     }
@@ -1383,6 +1436,21 @@ bool HumanMimicController::solve_base_skeleton(const std::vector<double>& q_meas
     dbg_wrist_branch_guard_ = false;
     dbg_wrist_candidate_step_ = 0.0;
     dbg_proximal_candidate_step_ = 0.0;
+
+    if (config_.unitree_ipopt && unitree_ipopt_.active() && q_target_.size() >= arm_dof_) {
+        unitree_ipopt_.submit(p_tcp_des, R_hand_des, q_target_);
+        std::vector<double> solved;
+        if (unitree_ipopt_.latest(&solved) && solved.size() == arm_dof_) {
+            for (size_t i = 0; i < arm_dof_; ++i) {
+                double joint = solved[i];
+                if (i < q_min_.size() && i < q_max_.size()) {
+                    joint = std::clamp(joint, q_min_[i], q_max_[i]);
+                }
+                q_target_[i] = joint;
+            }
+            return true;
+        }
+    }
 
     // Prefer commanded joints for the shoulder used by soft-reach / skeleton —
     // building geometry on lagged measured proximal joints is a common reason

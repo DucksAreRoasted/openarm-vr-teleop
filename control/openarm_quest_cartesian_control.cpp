@@ -693,6 +693,7 @@ HumanMimicConfig make_unitree_style_config(const std::string& urdf_path,
                                           const std::string& orientation_mapping, bool sim) {
     auto cfg = make_quest_base_config(urdf_path, arm_side, orientation_mapping, sim);
     apply_unitree_style_profile(&cfg);
+    cfg.unitree_arm_side = arm_side == "left_arm" ? "left" : "right";
     cfg.reference_yaw_rad = env_double_or("OPENARM_UNITREE_REFERENCE_YAW_DEG", 0.0) * M_PI / 180.0;
     if (!std::isfinite(cfg.reference_yaw_rad)) {
         throw std::runtime_error("reference yaw must be finite");

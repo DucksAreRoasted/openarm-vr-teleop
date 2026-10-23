@@ -129,6 +129,7 @@ if [[ "${OPENARM_QUEST_STARTUP_MOVE}" == "1" ]]; then
 fi
 
 cd "${ROOT}"
+export OPENARM_ROOT="${ROOT}"
 export OPENARM_LEROBOT_PYTHON="${PYTHON}"
 if [[ "${OPENARM_RECORD_PANEL:-1}" != "0" ]]; then
   "${PYTHON}" "${ROOT}/script/record_panel.py" \
