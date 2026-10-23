@@ -2390,7 +2390,7 @@ bool HumanMimicController::step(const std::vector<JointState>& current_joints,
     const bool post_nudge_stream = jog_bypass_remaining_ > 0;
 
     if (timed_out && !panel_jogging) {
-        if (!quest_timeout_active_) {
+        if (!quest_timeout_active_ && sample.valid) {
             std::cerr << log_prefix_ << "[human-mimic] Quest timeout (age="
                       << (std::isfinite(age_sec) ? age_sec : -1.0)
                       << "s) — freezing; re-grip required" << std::endl;
