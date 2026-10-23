@@ -57,8 +57,8 @@ extern char** environ;
 
 namespace {
 
-constexpr double kQuestReceiveHz = 90.0;
-constexpr double kQuestReferenceHz = FREQUENCY;  // 1000 Hz joint references; Quest target ~90 Hz
+constexpr double kQuestReceiveHz = 500.0;
+constexpr double kQuestReferenceHz = FREQUENCY;  // 1000 Hz joint references; Quest packets drained at 500 Hz
 
 std::string select_leaf_link(const std::string& urdf_path, const std::string& arm_side) {
     const std::string side = (arm_side == "left_arm") ? "left" : "right";
@@ -3501,7 +3501,7 @@ private:
     std::shared_ptr<MujocoTeleopHardware> sim_hardware_;
 };
 
-// ~90 Hz: drain Quest UDP and stamp receive time / sequence. Does not solve IK.
+// Drain Quest UDP and stamp receive time. IK is not solved here.
 class QuestReceiveThread : public PeriodicTimerThread {
 public:
     QuestReceiveThread(QuestPoseReceiver* receiver, std::string label, double hz = kQuestReceiveHz)

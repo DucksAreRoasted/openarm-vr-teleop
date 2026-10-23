@@ -32,9 +32,11 @@ OPENARM_UNITREE_REFERENCE_YAW_DEG=90 ./run.sh --sim
 - [xr_teleoperate 的逆解实现](https://github.com/unitreerobotics/xr_teleoperate/blob/main/teleop/robot_control/robot_arm_ik.py)：末端位置、旋转、关节正则、相邻解连续性和模型位置限位。
 - [TeleVuer 的坐标转换](https://github.com/unitreerobotics/televuer/blob/main/src/televuer/tv_wrapper.py)：显式转换 OpenXR 与机器人坐标，支持忽略头部俯仰及侧倾的水平参考。
 
-本模式采用位置 50、姿态 1、连续性 0.1、名义姿态 0.02 的目标权重，以前一解热启动，使用现有带 URDF 位置限位的 LM 求解，最多 30 次迭代。关闭虚拟肘部任务与软伸展塑形，保留工作范围裁剪、分支保护、速度／加速度限制及硬件安全链。
+本模式采用位置 50、姿态 1、连续性 0.1、名义姿态 0.02 的目标权重，以前一解热启动。逆解是宇树 `G1_29_ArmIK` 的 CasADi/IPOPT，模型换成 OpenArm 单臂 7 轴，关节平滑用他们的四帧加权 `[0.4, 0.3, 0.2, 0.1]`。求解在后台进程里跑，1000 Hz 循环只取 0.30 秒内的最新解；解释器找不到或求解失败时，仍用原来的 LM。`OPENARM_UNITREE_IPOPT=0` 可关掉 IPOPT。需要的环境与宇树文档一致：`conda create -n openarm-unitree python=3.10 pinocchio=3.1.0 numpy=1.26.4 casadi -c conda-forge`。
 
-适配差异：不引入宇树 SDK、CasADi/IPOPT、人体腰部偏移或持续跟头部旋转的参考；名义姿态使用 OpenArm 桌面准备姿态，未使用宇树的零姿态正则；未叠加宇树的四帧加权平均滤波。姿态标定仍遵守 `--orientation-mapping absolute|incremental`。因此测试结果只评价本适配，不能代表宇树原实现。
+适配差异：不引入宇树 SDK、TeleVuer/Vuer 会话、人体腰部偏移、手部坐标系 90° 旋转、臂长缩放，也不把他们的 RNEA 力矩发到电机。重力前馈仍走现有的实测关节角和 CAN。姿态标定仍遵守 `--orientation-mapping absolute|incremental`。因此测试结果只评价本适配，不能代表宇树原实现。
+
+实时链路只借用他们「画面和姿态分开、丢了就用最新一帧」的做法。宇树的 WebRTC 是把头上的相机画面送到头显（teleimager，ZMQ 或 WebRTC，WebRTC 优先）；手柄姿态仍走 Vuer 的 WebSocket，控制循环默认 30 Hz。这边头显是透视，不把头上的相机画进视野，所以 WebRTC 用来传手柄姿态：不可靠、不重传。WebSocket 留下做信令、采集回执，以及 WebRTC 没接通时的退路。不访问公网 STUN。控制端把 UDP 排空从 90 Hz 提到 500 Hz，避免包在内核里再等一个 11 ms 的轮询。
 
 ## 可复现对照
 

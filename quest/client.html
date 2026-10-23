@@ -151,12 +151,17 @@
         let websocket = null;
         let xrSession = null;
         let xrRefSpace = null;
+        let peer = null;
+        let poseChannel = null;
         
         function updateStatus(connected) {
             const statusDiv = document.getElementById('status');
             if (connected) {
                 statusDiv.className = 'status connected';
-                statusDiv.textContent = `Connected to ${websocketUrl}`;
+                const live = poseChannel && poseChannel.readyState === 'open';
+                statusDiv.textContent = live
+                    ? `Connected, poses on WebRTC`
+                    : `Connected to ${websocketUrl}`;
             } else {
                 statusDiv.className = 'status disconnected';
                 statusDiv.textContent = `Disconnected from ${websocketUrl}`;
@@ -168,12 +173,21 @@
 
             try {
                 websocket = new WebSocket(websocketUrl);
-                websocket.onopen = () => { console.log(`WS Connected`); updateStatus(true); };
+                websocket.onopen = () => { console.log(`WS Connected`); updateStatus(true); startPoseChannel(); };
                 websocket.onerror = (e) => { console.error(`WS Error:`, e); updateStatus(false); };
                 websocket.onclose = () => { updateStatus(false); };
                 websocket.onmessage = async (event) => {
                     let message;
                     try { message = JSON.parse(event.data); } catch { return; }
+                    if (message.type === 'webrtc_answer' && peer) {
+                        try {
+                            await peer.setRemoteDescription({ type: 'answer', sdp: message.sdp });
+                        } catch (error) {
+                            console.error('WebRTC answer rejected', error);
+                        }
+                        return;
+                    }
+                    if (message.type === 'webrtc_unavailable') return;
                     if (message.type !== 'capture_feedback') return;
                     document.getElementById('captureStatus').textContent = message.message;
                     const hand = message.action.startsWith('left-') ? 'left' : 'right';
@@ -237,9 +251,58 @@
             }
         }
 
+        function waitForIce(connection) {
+            if (connection.iceGatheringState === 'complete') return Promise.resolve();
+            return new Promise((resolve) => {
+                const timer = setTimeout(resolve, 1500);
+                connection.addEventListener('icegatheringstatechange', () => {
+                    if (connection.iceGatheringState === 'complete') {
+                        clearTimeout(timer);
+                        resolve();
+                    }
+                });
+            });
+        }
+
+        async function startPoseChannel() {
+            if (!window.RTCPeerConnection || !websocket || websocket.readyState !== WebSocket.OPEN) return;
+            if (peer) {
+                peer.close();
+                peer = null;
+                poseChannel = null;
+            }
+            // No STUN. Host candidates are enough on the same LAN and do not wait on the internet.
+            peer = new RTCPeerConnection({ iceServers: [] });
+            poseChannel = peer.createDataChannel('poses', { ordered: false, maxRetransmits: 0 });
+            poseChannel.onopen = () => updateStatus(true);
+            poseChannel.onclose = () => updateStatus(websocket && websocket.readyState === WebSocket.OPEN);
+            try {
+                const offer = await peer.createOffer();
+                await peer.setLocalDescription(offer);
+                await waitForIce(peer);
+                if (websocket && websocket.readyState === WebSocket.OPEN && peer.localDescription) {
+                    websocket.send(JSON.stringify({ type: 'webrtc_offer', sdp: peer.localDescription.sdp }));
+                }
+            } catch (error) {
+                console.error('WebRTC setup failed', error);
+                peer.close();
+                peer = null;
+                poseChannel = null;
+            }
+        }
+
         function sendControllerData(data) {
+            const text = JSON.stringify(data);
+            if (poseChannel && poseChannel.readyState === 'open') {
+                try {
+                    poseChannel.send(text);
+                    return;
+                } catch (error) {
+                    console.error('WebRTC pose send failed', error);
+                }
+            }
             if (websocket && websocket.readyState === WebSocket.OPEN) {
-                websocket.send(JSON.stringify(data));
+                websocket.send(text);
             }
         }
         
@@ -337,8 +400,10 @@
                 let lastDisplayUpdate = -Infinity;
                 let lastTrackingUpdate = -Infinity;
                 const frameCallback = (time, frame) => {
-                    // Tracking/network work is capped at 60 Hz independently of headset refresh.
-                    if (time-lastTrackingUpdate < 1000/60) {
+                    // WebSocket stays at 60 Hz so TCP cannot queue stale poses.
+                    // The WebRTC channel does not retransmit, so it follows the headset up to 120 Hz.
+                    const minInterval = (poseChannel && poseChannel.readyState === 'open') ? 1000/120 : 1000/60;
+                    if (time-lastTrackingUpdate < minInterval) {
                         if (session.renderState.baseLayer) {
                             gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
                             gl.clearColor(0,0,0,0);
@@ -474,6 +539,11 @@
         function stopTracking() {
             if (xrSession) {
                 xrSession.end();
+            }
+            if (peer) {
+                peer.close();
+                peer = null;
+                poseChannel = null;
             }
             if (websocket) {
                 websocket.close();

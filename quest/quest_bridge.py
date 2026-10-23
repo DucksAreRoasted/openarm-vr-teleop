@@ -183,6 +183,113 @@ class HandBridgeStats:
         self._last_report = now
 
 
+class _ClientSession:
+    """One headset. Poses prefer an unreliable WebRTC data channel; WebSocket is the fallback and the signaling path."""
+
+    def __init__(self, bridge: "QuestBridge", websocket) -> None:
+        self.bridge = bridge
+        self.websocket = websocket
+        self.last_timestamp = -1
+        self.shortcuts = CaptureShortcuts()
+        self.capture_lock = asyncio.Lock()
+        self.capture_tasks: set = set()
+        self.pc = None
+
+    async def handle_message(self, data: dict) -> None:
+        if data.get("type") == "webrtc_offer":
+            await self.accept_webrtc(data)
+            return
+        await self.ingest_pose(data)
+
+    async def ingest_pose(self, data: dict) -> None:
+        timestamp = data.get("timestamp", 0)
+        if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp <= self.last_timestamp:
+            return
+        self.last_timestamp = timestamp
+        right = data.get("rightController")
+        left = data.get("leftController")
+        for hand, controller in (("left", left), ("right", right)):
+            action = self.shortcuts.update(hand, controller, time.monotonic())
+            if not action:
+                continue
+            if self.capture_tasks:
+                await self.websocket.send(json.dumps({
+                    "type": "capture_feedback",
+                    "action": action,
+                    "ok": False,
+                    "message": "正在处理上一次采集操作，请稍后再按。",
+                }, ensure_ascii=False))
+            else:
+                task = asyncio.create_task(
+                    self.bridge.capture_shortcut(self.websocket, action, self.capture_lock)
+                )
+                self.capture_tasks.add(task)
+                task.add_done_callback(self.capture_tasks.discard)
+        if right:
+            right["timestamp"] = timestamp
+            self.bridge.right_forwarder.send_controller(right)
+        if self.bridge.bimanual and left:
+            left["timestamp"] = timestamp
+            self.bridge.left_forwarder.send_controller(left)
+        self.bridge.right_stats.maybe_report(self.bridge.client_connected)
+        if self.bridge.bimanual:
+            self.bridge.left_stats.maybe_report(self.bridge.client_connected)
+
+    async def accept_webrtc(self, data: dict) -> None:
+        # Host candidates only. A public STUN server is what makes Unitree's
+        # video path wait on the internet; this link stays on the LAN.
+        sdp = data.get("sdp")
+        if not isinstance(sdp, str) or not sdp:
+            return
+        try:
+            from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+        except ImportError:
+            print("[quest-bridge] aiortc is not installed; poses stay on WebSocket", flush=True)
+            try:
+                await self.websocket.send(json.dumps({"type": "webrtc_unavailable"}))
+            except ConnectionClosed:
+                pass
+            return
+        if self.pc is not None:
+            await self.pc.close()
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        self.pc = pc
+
+        @pc.on("datachannel")
+        def on_datachannel(channel) -> None:
+            if channel.label != "poses":
+                return
+            print("[quest-bridge] WebRTC pose channel open", flush=True)
+
+            @channel.on("message")
+            def on_message(message) -> None:
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    return
+                if isinstance(payload, dict):
+                    asyncio.create_task(self.ingest_pose(payload))
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp, "offer"))
+        await pc.setLocalDescription(await pc.createAnswer())
+        deadline = time.monotonic() + 1.5
+        while pc.iceGatheringState != "complete" and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        local = pc.localDescription
+        if local is None:
+            return
+        await self.websocket.send(json.dumps({"type": "webrtc_answer", "sdp": local.sdp}))
+
+    async def close(self) -> None:
+        for task in self.capture_tasks:
+            task.cancel()
+        if self.pc is not None:
+            await self.pc.close()
+            self.pc = None
+
+
 class QuestBridge:
     def __init__(
         self,
@@ -228,43 +335,16 @@ class QuestBridge:
         self.client_connected = True
         self.ws_clients.add(websocket)
         print(f"Quest client connected: {websocket.remote_address}", flush=True)
-        last_timestamp = -1
-        shortcuts = CaptureShortcuts()
-        capture_lock = asyncio.Lock()
-        capture_tasks = set()
+        session = _ClientSession(self, websocket)
         try:
             async for message in websocket:
                 data = json.loads(message)
-                timestamp = data.get("timestamp", 0)
-                if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp <= last_timestamp:
-                    continue
-                last_timestamp = timestamp
-                right = data.get("rightController")
-                left = data.get("leftController")
-                for hand, controller in (("left", left), ("right", right)):
-                    action = shortcuts.update(hand, controller, time.monotonic())
-                    if action:
-                        if capture_tasks:
-                            await websocket.send(json.dumps({"type": "capture_feedback", "action": action,
-                                "ok": False, "message": "正在处理上一次采集操作，请稍后再按。"}, ensure_ascii=False))
-                        else:
-                            task = asyncio.create_task(self.capture_shortcut(websocket, action, capture_lock))
-                            capture_tasks.add(task)
-                            task.add_done_callback(capture_tasks.discard)
-                if right:
-                    right["timestamp"] = timestamp
-                    self.right_forwarder.send_controller(right)
-                if self.bimanual and left:
-                    left["timestamp"] = timestamp
-                    self.left_forwarder.send_controller(left)
-                self.right_stats.maybe_report(self.client_connected)
-                if self.bimanual:
-                    self.left_stats.maybe_report(self.client_connected)
+                if isinstance(data, dict):
+                    await session.handle_message(data)
         except ConnectionClosed:
             print("Quest client disconnected", flush=True)
         finally:
-            for task in capture_tasks:
-                task.cancel()
+            await session.close()
             self.ws_clients.discard(websocket)
             self.client_connected = bool(self.ws_clients)
 

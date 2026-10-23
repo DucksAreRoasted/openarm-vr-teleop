@@ -1,7 +1,10 @@
 mujoco==3.12.0
 websockets==15.0.1
+aiortc>=1.9
 numpy>=2.0
 pandas>=2.2
+# 宇树 IPOPT 逆解需要带 CasADi 的 Pinocchio。PyPI 的 pin 不含该绑定。
+# conda create -n openarm-unitree python=3.10 pinocchio=3.1.0 numpy=1.26.4 casadi -c conda-forge
 pyarrow>=15.0
 PySide6>=6.5
 pyyaml>=6.0
