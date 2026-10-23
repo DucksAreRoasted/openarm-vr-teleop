@@ -55,6 +55,7 @@ add_library(vr_control_core STATIC
   src/controller/reference_smoother.cpp src/controller/human_mimic_kinematics.cpp
   src/controller/virtual_arm_skeleton.cpp src/controller/human_mimic_ik_solver.cpp
   src/controller/joint_reference_generator.cpp src/controller/human_mimic_controller.cpp
+  src/controller/unitree_ipopt_client.cpp
   src/openarm_port/openarm_init.cpp src/openarm_port/joint_mapper.cpp
   src/safety/safety_filter.cpp src/io/teleop_io.cpp src/io/quest_pose_receiver.cpp
   src/io/teleop_trajectory_logger.cpp
@@ -99,7 +100,8 @@ add_library(human_mimic_test_core STATIC
   src/controller/human_mimic_ik_solver.cpp
   src/controller/joint_reference_generator.cpp
   src/controller/reference_smoother.cpp
-  src/controller/human_mimic_controller.cpp)
+  src/controller/human_mimic_controller.cpp
+  src/controller/unitree_ipopt_client.cpp)
 target_include_directories(human_mimic_test_core PUBLIC src)
 target_link_libraries(human_mimic_test_core PUBLIC Eigen3::Eigen
   ${orocos_kdl_LIBRARIES} kdl_parser::kdl_parser urdfdom::urdfdom_model)
